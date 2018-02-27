@@ -58,19 +58,25 @@ def prepare_info(t1, t2, fai, bed12records, log):
 
 def get_and_prepare_cigar(t1cdna, t2cdna):
 
-    result = parasail.sg_trace_scan_16(str(t1cdna), str(t2cdna), 11, 1, parasail.blosum62)
+    cigar_pattern = re.compile("(=|M|D|I|X|S|H)")
+    result = parasail.sg_trace_scan_16(str(t1cdna), str(t2cdna), 11, 1, parasail.blosum100)
+    print(result.cigar.decode)
     values = re.split(cigar_pattern, result.cigar.decode)
     values = [(int(values[_ * 2]), values[_ * 2 + 1]) for _ in range(int((len(values) - 1) / 2))]
     return result, values
 
-
-def create_translation_arrat(cigar):
+def create_translation_array(cigar, query_exons, target_exons):
 
     """Inspired by https://github.com/MullinsLab/Bio-Cigar/blob/master/lib/Bio/Cigar.pm
-    This function will create a double array, where each of the possible positions of query1 are associated with its
-    positions on query 2.
+    This function will translate the exons into a array-like space, allowing for
+    comparison of the two structures.
+
+    The main problem here is how we want to visualise
+
+
     """
 
+    # Format: operation: [consumes_query, consumes_target]
     op_consumes = {
         "M": (True, True),
         "=": (True, True),
@@ -83,45 +89,54 @@ def create_translation_arrat(cigar):
         "X": (True, True)
     }
 
-    q_2_t = dict()
-    t_2_q = dict()
+    # First thing: determine the total length of the common space
+    common_length = sum(length for length, op in cigar if any(op_consumes[op]))
 
-    start_target_pos, end_target_pos = 0, 0
-    start_query_pos, end_query_pos = 0, 0
+    print(common_length)
+    query_array = [None] * common_length
+    target_array = [None] * common_length
+
+    # Now we have to translate the exons into this common space
+    # We will do this by creating "exons" derived from the alignment
+
+    common_pos = 0
+    query_pos = 0
+    target_pos = 0
 
     for length, op in cigar:
         consumes_query, consumes_target = op_consumes[op]
-        if consumes_query and consumes_target:
-
-            end_query_pos += length
-            end_target_pos += length
-            # The two have the same length
-            for query_key, target_key in itertools.zip_longest(range(start_query_pos, end_query_pos),
-                                                    range(start_target_pos, end_target_pos)):
-                q_2_t[query_key] = target_key
-                t_2_q[target_key] = query_key
-        elif consumes_target:
-            # The query is skipped:
-            end_target_pos += length
-            for query_key, target_key in itertools.zip_longest([start_query_pos],
-                                                               range(start_target_pos, end_target_pos),
-                                                               fillvalue=start_query_pos):
-                t_2_q[target_key] = query_key
-            q_2_t[start_query_pos] = range(start_target_pos, end_target_pos)
-
-        elif consumes_query:
-            # The target is skipped:
-            end_query_pos += length
-            for query_key, target_key in itertools.zip_longest(range(start_query_pos, end_query_pos),
-                                                               [start_target_pos],
-                                                               fillvalue=start_target_pos):
-                q_2_t[query_key] = target_key
-            t_2_q[start_target_pos] = range(start_query_pos, end_query_pos)
-
-        elif not consumes_query and not consumes_target:
+        if not any((consumes_query, consumes_target)):
+            last_op_consumed = 0b0
             continue
+        else:
+            for pos in range(common_pos, common_pos + length):
+                target_pos += int(consumes_target)
+                query_pos += int(consumes_query)
+                try:
+                    query_array[pos] = query_pos
+                except IndexError:
+                    raise IndexError(pos)
+                target_array[pos] = target_pos
+            common_pos += length
 
-    return q_2_t, t_2_q
+    c_query_exons = []
+    c_target_exons = []
+
+    for exon in query_exons:
+        # Series of tuples
+        start, end = exon
+        try:
+            c_start, c_end = query_array.index(start), query_array.index(end)
+        except ValueError:
+            raise ValueError(query_array)
+        c_query_exons.append((c_start, c_end))
+
+    for exon in target_exons:
+        start, end = exon
+        c_start, c_end = target_array.index(start), target_array.index(end)
+        c_target_exons.append((c_start, c_end))
+
+    return c_query_exons, c_target_exons
 
 
 def main():
@@ -158,7 +173,6 @@ def main():
                 t1cdna, t2cdna = cdnas
                 result, cigar = get_and_prepare_cigar(t1cdna, t2cdna)
 
-                q_2_t, t_2_q = create_translation_arrat(cigar)
                 t1bed, t2bed = beds
                 if t1bed.strand == "-":
                     t1blocks = [0] + list(reversed(t1bed.block_sizes))
@@ -176,32 +190,8 @@ def main():
                 for pos in range(t1bed.block_count):
                     t1_exons.append((int(t1_ar[pos]), int(t1_ar[pos + 1] - 1)))
                 for pos in range(t2bed.block_count):
-                    # Here we are going to translate ...
-                    exon = (t2_ar[pos], t2_ar[pos + 1] - 1)
-                    trans_exon_start = t_2_q[exon[0]]
-                    trans_exon_end = t_2_q[exon[1]]
-                    if not isinstance(trans_exon_start, int):
-                        # This is RANGE of values
-                        trans_exon_start = int(trans_exon_start.start)
-
-                    if not isinstance(trans_exon_end, int):
-                        trans_exon_end = int(trans_exon_end.end)
-                    t2_exons.append((int(trans_exon_start), int(trans_exon_end)))
-                t1_transcript = Transcript()
-                t1_transcript.chrom = "foo"
-                t1_transcript.add_exons(t1_exons)
-                t1_transcript.strand = "+"
-                t1_transcript.id = t1
-
-                t2_transcript = Transcript()
-                t2_transcript.chrom = "foo"
-                t2_transcript.add_exons(t2_exons)
-                t2_transcript.strand = "+"
-                t2_transcript.id = t2
-
-                comp = Assigner.compare(t1_transcript, t2_transcript)
-                print(comp)
-
+                    t2_exons.append((int(t2_ar[pos]), int(t2_ar[pos + 1] - 1)))
+                create_translation_array(cigar, t1_exons, t2_exons)
 
     return
 
