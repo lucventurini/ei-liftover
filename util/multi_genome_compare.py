@@ -62,7 +62,7 @@ def prepare_info(t1, t2, fai, bed12records, log):
 def get_and_prepare_cigar(t1cdna, t2cdna):
 
     # cigar_pattern = re.compile("(=|M|D|I|X|S|H)")
-    result = parasail.sg_trace_scan_16(str(t1cdna), str(t2cdna), 11, 1, parasail.blosum100)
+    result = parasail.sg_trace_scan_32(str(t1cdna), str(t2cdna), 11, 1, parasail.blosum100)
     # print(result.cigar.decode)
     values = re.split(cigar_pattern, result.cigar.decode)
     values = [(int(values[_ * 2]), values[_ * 2 + 1]) for _ in range(int((len(values) - 1) / 2))]
