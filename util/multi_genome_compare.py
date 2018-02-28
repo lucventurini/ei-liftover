@@ -11,7 +11,7 @@ import re
 import numpy as np
 from Mikado.scales.assigner import Assigner 
 from Mikado.transcripts import Transcript
-from contrast import array_compare
+from eiliftover.util.contrast import array_compare
 from collections import defaultdict
 import sys
 
