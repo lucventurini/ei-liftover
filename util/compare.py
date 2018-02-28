@@ -11,6 +11,9 @@ import re
 import numpy as np
 from Mikado.scales.assigner import Assigner 
 from Mikado.transcripts import Transcript
+from contrast import array_compare
+from collections import defaultdict
+import sys
 
 
 __doc__ = """"""
@@ -58,12 +61,13 @@ def prepare_info(t1, t2, fai, bed12records, log):
 
 def get_and_prepare_cigar(t1cdna, t2cdna):
 
-    cigar_pattern = re.compile("(=|M|D|I|X|S|H)")
+    # cigar_pattern = re.compile("(=|M|D|I|X|S|H)")
     result = parasail.sg_trace_scan_16(str(t1cdna), str(t2cdna), 11, 1, parasail.blosum100)
-    print(result.cigar.decode)
+    # print(result.cigar.decode)
     values = re.split(cigar_pattern, result.cigar.decode)
     values = [(int(values[_ * 2]), values[_ * 2 + 1]) for _ in range(int((len(values) - 1) / 2))]
     return result, values
+
 
 def create_translation_array(cigar, query_exons, target_exons):
 
@@ -92,7 +96,7 @@ def create_translation_array(cigar, query_exons, target_exons):
     # First thing: determine the total length of the common space
     common_length = sum(length for length, op in cigar if any(op_consumes[op]))
 
-    print(common_length)
+    # print(common_length)
     query_array = [None] * common_length
     target_array = [None] * common_length
 
@@ -100,23 +104,21 @@ def create_translation_array(cigar, query_exons, target_exons):
     # We will do this by creating "exons" derived from the alignment
 
     common_pos = 0
-    query_pos = 0
-    target_pos = 0
+    query_pos = -1
+    target_pos = -1
 
     for length, op in cigar:
         consumes_query, consumes_target = op_consumes[op]
         if not any((consumes_query, consumes_target)):
-            last_op_consumed = 0b0
             continue
         else:
             for pos in range(common_pos, common_pos + length):
-                target_pos += int(consumes_target)
-                query_pos += int(consumes_query)
-                try:
+                if consumes_query:
+                    query_pos +=1
                     query_array[pos] = query_pos
-                except IndexError:
-                    raise IndexError(pos)
-                target_array[pos] = target_pos
+                if consumes_target:
+                    target_pos += 1
+                    target_array[pos] = target_pos
             common_pos += length
 
     c_query_exons = []
@@ -125,10 +127,7 @@ def create_translation_array(cigar, query_exons, target_exons):
     for exon in query_exons:
         # Series of tuples
         start, end = exon
-        try:
-            c_start, c_end = query_array.index(start), query_array.index(end)
-        except ValueError:
-            raise ValueError(query_array)
+        c_start, c_end = query_array.index(start), query_array.index(end)
         c_query_exons.append((c_start, c_end))
 
     for exon in target_exons:
@@ -136,7 +135,7 @@ def create_translation_array(cigar, query_exons, target_exons):
         c_start, c_end = target_array.index(start), target_array.index(end)
         c_target_exons.append((c_start, c_end))
 
-    return c_query_exons, c_target_exons
+    return c_query_exons, c_target_exons, list(zip(query_array, target_array))
 
 
 def main():
@@ -150,6 +149,8 @@ def main():
                         help="Tab separated file with the groups to be analysed.")
     parser.add_argument("--bed12", required=True,
                         help="BED12 file with the coordinates of the models to analyse.")
+    parser.add_argument("-d", "--detailed", type=argparse.FileType("wt"), required=True)
+    parser.add_argument("-o", "--out", default=sys.stdout, type=argparse.FileType("wt"), required=True)
     args = parser.parse_args()
 
     log = create_default_logger("log", level="INFO")
@@ -160,38 +161,85 @@ def main():
     fai = pyfaidx.Fasta(args.cdnas)
     # Step 3: for each group in the groups file, perform a pairwise comparison
 
-    with open(args.groups) as groups:
-        for line in groups:
-            cases = line.rstrip().split()
-            for comb in itertools.combinations(cases, 2):
-                t1, t2 = comb
-                correct, cdnas, beds = prepare_info(t1, t2, fai, bed12records, log)
-                if correct is False:
-                    continue
-                # Now the complicated part ...
-                # TODO: Check proper alignment parameters
-                t1cdna, t2cdna = cdnas
-                result, cigar = get_and_prepare_cigar(t1cdna, t2cdna)
+    groups = defaultdict(list)
 
-                t1bed, t2bed = beds
-                if t1bed.strand == "-":
-                    t1blocks = [0] + list(reversed(t1bed.block_sizes))
-                else:
-                    t1blocks = [0] + t1bed.block_sizes
-                if t2bed.strand == "-":
-                    t2blocks = [0] + list(reversed(t2bed.block_sizes))
-                else:
-                    t2blocks = [0] + t2bed.block_sizes
+    with open(args.groups) as group_file:
+        for line in group_file:
+            if line[0] == "#":
+                continue
+            tid, group = line.rstrip().split()
+            groups[group].append(tid)
 
-                t1_ar = np.cumsum(t1blocks)
-                t2_ar = np.cumsum(t2blocks)
-                t1_exons = []
-                t2_exons = []
-                for pos in range(t1bed.block_count):
-                    t1_exons.append((int(t1_ar[pos]), int(t1_ar[pos + 1] - 1)))
-                for pos in range(t2bed.block_count):
-                    t2_exons.append((int(t2_ar[pos]), int(t2_ar[pos + 1] - 1)))
-                create_translation_array(cigar, t1_exons, t2_exons)
+    print(*"Group T1 T2 Identity Recall(Exon) Precision(Exon) F1(Exon) Recall(Junction) Precision(Junction) F1(Junction)".split(),
+          sep="\t", file=args.detailed)
+    header = "Group Min(Identity) Max(Identity)".split()
+    header.extend(["Min(Exon F1)", "Max(Exon F1)"])
+    header.extend(["Min(Junction F1)", "Max(Junction F1)"])
+    header.append("IDs")
+    print(*header, file=args.out, sep="\t")
+
+
+    for group, cases in groups.items():
+
+        exon_f1 = []
+        junc_f1 = []
+        iden = []
+
+        for comb in itertools.combinations(cases, 2):
+            t1, t2 = comb
+            correct, cdnas, beds = prepare_info(t1, t2, fai, bed12records, log)
+            if correct is False:
+                continue
+            # Now the complicated part ...
+            # TODO: Check proper alignment parameters
+            t1cdna, t2cdna = cdnas
+            result, cigar = get_and_prepare_cigar(t1cdna, t2cdna)
+
+            t1bed, t2bed = beds
+            if t1bed.strand == "-":
+                t1blocks = [0] + list(reversed(t1bed.block_sizes))
+            else:
+                t1blocks = [0] + t1bed.block_sizes
+            if t2bed.strand == "-":
+                t2blocks = [0] + list(reversed(t2bed.block_sizes))
+            else:
+                t2blocks = [0] + t2bed.block_sizes
+
+            t1_ar = np.cumsum(t1blocks)
+            t2_ar = np.cumsum(t2blocks)
+            t1_exons = []
+            t2_exons = []
+            for pos in range(t1bed.block_count):
+                t1_exons.append((int(t1_ar[pos]), int(t1_ar[pos + 1] - 1)))
+            for pos in range(t2bed.block_count):
+                t2_exons.append((int(t2_ar[pos]), int(t2_ar[pos + 1] - 1)))
+            c_t1_exons, c_t2_exons, common = create_translation_array(cigar, t1_exons, t2_exons)
+
+            identical = sum(length for length, op in cigar if op in ("M", "="))
+            if identical == 0:
+                raise ValueError(cigar)
+            identity = round(100 * identical / len(common), 2)
+
+            result = array_compare(np.ravel(np.array(c_t1_exons)),
+                                   np.ravel(np.array(c_t2_exons))).reshape((2, 3))
+
+            print(group, t1, t2, identity,  # c_t1_exons, c_t2_exons,
+                  *["{:0.2f}".format(100 * _) for _ in result[0]],
+                  *["{:0.2f}".format(100 * _) for _ in result[1]],
+                  sep="\t", file=args.detailed)
+            exon_f1.append(result[0][2])
+            junc_f1.append(result[1][2])
+            iden.append(identity)
+
+        print(group,
+              "{:0.2f}".format(min(100 * iden)),
+              "{:0.2f}".format(max(iden)),
+              "{:0.2f}".format(min(junc_f1)),
+              "{:0.2f}".format(max(junc_f1)),
+              "{:0.2f}".format(min(exon_f1)),
+              "{:0.2f}".format(max(exon_f1)),
+              ",".join(cases), sep="\t", file=args.out)
+
 
     return
 
