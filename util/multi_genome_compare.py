@@ -170,14 +170,13 @@ def main():
             tid, group = line.rstrip().split()
             groups[group].append(tid)
 
-    print(*"Group T1 T2 Identity Recall(Exon) Precision(Exon) F1(Exon) Recall(Junction) Precision(Junction) F1(Junction)".split(),
+    print(*"Group T1 T1 exons T2 T2 exons Identity Recall(Exon) Precision(Exon) F1(Exon) Recall(Junction) Precision(Junction) F1(Junction)".split(),
           sep="\t", file=args.detailed)
     header = "Group Min(Identity) Max(Identity)".split()
-    header.extend(["Min(Exon F1)", "Max(Exon F1)"])
     header.extend(["Min(Junction F1)", "Max(Junction F1)"])
+    header.extend(["Min(Exon F1)", "Max(Exon F1)"])
     header.append("IDs")
     print(*header, file=args.out, sep="\t")
-
 
     for group, cases in groups.items():
 
@@ -223,7 +222,7 @@ def main():
             result = array_compare(np.ravel(np.array(c_t1_exons)),
                                    np.ravel(np.array(c_t2_exons))).reshape((2, 3))
 
-            print(group, t1, t2, identity,  # c_t1_exons, c_t2_exons,
+            print(group, t1, c_t1_exons, t2, c_t2_exons, identity,  # c_t1_exons, c_t2_exons,
                   *["{:0.2f}".format(100 * _) for _ in result[0]],
                   *["{:0.2f}".format(100 * _) for _ in result[1]],
                   sep="\t", file=args.detailed)
