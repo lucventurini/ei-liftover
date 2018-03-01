@@ -62,7 +62,7 @@ def prepare_info(t1, t2, fai, bed12records, log):
 def get_and_prepare_cigar(t1cdna, t2cdna):
 
     # cigar_pattern = re.compile("(=|M|D|I|X|S|H)")
-    result = parasail.sg_trace_scan_32(str(t1cdna), str(t2cdna), 11, 1, parasail.blosum100)
+    result = parasail.sg_trace_scan_32(str(t1cdna).upper(), str(t2cdna).upper(), 11, 1, parasail.blosum100)
     # print(result.cigar.decode)
     values = re.split(cigar_pattern, result.cigar.decode)
     values = [(int(values[_ * 2]), values[_ * 2 + 1]) for _ in range(int((len(values) - 1) / 2))]
@@ -170,7 +170,7 @@ def main():
             tid, group = line.rstrip().split()
             groups[group].append(tid)
 
-    print(*"Group T1 T1 exons T2 T2 exons Identity Recall(Exon) Precision(Exon) F1(Exon) Recall(Junction) Precision(Junction) F1(Junction)".split(),
+    print(*"Group T1 T1 exons T2 T2 exons Identity Recall(Exon) Precision(Exon) F1(Exon) Recall(Junction) Precision(Junction) F1(Junction) CCode".split(),
           sep="\t", file=args.detailed)
     header = "Group Min(Identity) Max(Identity)".split()
     header.extend(["Min(Junction F1)", "Max(Junction F1)"])
@@ -220,11 +220,14 @@ def main():
             identity = round(100 * identical / len(common), 2)
 
             result = array_compare(np.ravel(np.array(c_t1_exons)),
-                                   np.ravel(np.array(c_t2_exons))).reshape((2, 3))
+                                   np.ravel(np.array(c_t2_exons)), identity)
+
+            result, ccode = result[:-1].reshape((2, 3)), result[-1]
 
             print(group, t1, c_t1_exons, t2, c_t2_exons, identity,  # c_t1_exons, c_t2_exons,
                   *["{:0.2f}".format(100 * _) for _ in result[0]],
                   *["{:0.2f}".format(100 * _) for _ in result[1]],
+                  ccode,
                   sep="\t", file=args.detailed)
             exon_f1.append(result[0][2])
             junc_f1.append(result[1][2])

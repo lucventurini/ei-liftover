@@ -26,11 +26,12 @@ cdef double calc_f1(double recall, double precision):
 
 
 @cython.cdivision(True)
-cpdef np.ndarray array_compare(np.ndarray[DTYPE_t] ref, np.ndarray[DTYPE_t] pred):
+cpdef np.ndarray array_compare(np.ndarray[DTYPE_t] ref, np.ndarray[DTYPE_t] pred, double identity):
 
     # Calculate the junction intersection
     cdef:
         np.ndarray result
+        char ccode
         np.ndarray ref_exons, pred_exons
         np.ndarray[DTYPE_t] ref_junc, pred_junc
         double junction_recall, junction_precision, junction_f1
@@ -41,6 +42,19 @@ cpdef np.ndarray array_compare(np.ndarray[DTYPE_t] ref, np.ndarray[DTYPE_t] pred
         double exon_found
         double splice_found
 
+    ref_exons = ref.reshape((<int>ref.shape[0] / 2, 2))
+    pred_exons = pred.reshape((<int>pred.shape[0] / 2, 2))
+
+    found = 0
+    for cycling in range(ref_exons.shape[0]):
+        exon_res = np.where(np.all(ref_exons[cycling] == pred_exons, axis=1))[0]
+        # print(res, res.shape[0])
+        if exon_res.shape[0] > 0:
+            found += 1
+
+    exon_recall = found / < double > ref_exons.shape[0]
+    exon_precision = found / < double > pred_exons.shape[0]
+    exon_f1 = calc_f1(exon_recall, exon_precision)
 
     if ref.shape[0] > 2 and pred.shape[0] > 2:
         splice_found = 0
@@ -57,25 +71,28 @@ cpdef np.ndarray array_compare(np.ndarray[DTYPE_t] ref, np.ndarray[DTYPE_t] pred
         junction_recall = splice_found / <double> ref_junc.shape[0]
         junction_precision = splice_found / <double> pred_junc.shape[0]
         junction_f1 = calc_f1(junction_recall, junction_precision)
-        pass
+        if junction_f1 == 1:
+            ccode = "="
+        elif junction_f1 > 0:
+            ccode = "j"
+        else:
+            ccode = "h"
     else:
-        junction_recall, junction_precision, junction_f1 = 0, 0, 0
-
-    ref_exons = ref.reshape((<int>ref.shape[0] / 2, 2))
-    pred_exons = pred.reshape((<int>pred.shape[0] / 2, 2))
-
-    found = 0
-    for cycling in range(ref_exons.shape[0]):
-        exon_res = np.where(np.all(ref_exons[cycling]==pred_exons, axis=1))[0]
-        # print(res, res.shape[0])
-        if exon_res.shape[0] > 0:
-            found += 1
-
-    exon_recall = found / <double>ref_exons.shape[0]
-    exon_precision = found / <double>pred_exons.shape[0]
-    exon_f1 = calc_f1(exon_recall, exon_precision)
+        if ref.shape[0] == 2 and pred.shape[0] == 2:
+            junction_recall, junction_precision, junction_f1 = 1, 1, 1
+            if identity >= 80:
+                ccode = "_"
+            else:
+                ccode = "m"
+        else:
+            junction_recall, junction_precision, junction_f1 = 0, 0, 0
+            if ref.shape[0] > pred.shape[0]:
+                ccode = "g"
+            else:
+                ccode = "G"
 
     result = np.array([exon_recall, exon_precision, exon_f1,
-                        junction_recall, junction_precision, junction_f1])
+                        junction_recall, junction_precision, junction_f1,
+                       ccode])
 
     return result
