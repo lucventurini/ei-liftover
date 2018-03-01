@@ -222,12 +222,12 @@ def main():
             result = array_compare(np.ravel(np.array(c_t1_exons)),
                                    np.ravel(np.array(c_t2_exons)), identity)
 
-            result, ccode = result[:-1].reshape((2, 3)), result[-1]
+            result, ccode = result[:-1].reshape((2, 3)), int(result[-1])
 
             print(group, t1, c_t1_exons, t2, c_t2_exons, identity,  # c_t1_exons, c_t2_exons,
                   *["{:0.2f}".format(100 * _) for _ in result[0]],
                   *["{:0.2f}".format(100 * _) for _ in result[1]],
-                  ccode,
+                  chr(ccode),
                   sep="\t", file=args.detailed)
             exon_f1.append(result[0][2])
             junc_f1.append(result[1][2])
