@@ -23,17 +23,43 @@ import os
 __doc__ = """"""
 
 
-def memoize_bed(string):
+def memoize_bed(string, sql):
 
     """Function to memoize a BED12 file for fast access"""
 
-    records = dict()
+    db = sqlite3.connect(sql)
+    db.execute("CREATE TABLE IF NOT EXISTS bed (chrom TEXT, start INT, \
+    end INT, name TEXT, score REAL, strand CHAR, thick_start INT, \
+    thick_end INT, rgb TEXT, count INT, sizes TEXT, starts TEXT)")
+    db.execute("CREATE INDEX IF NOT EXISTS bedidx ON bed(name)")
+
+    # records = dict()
     for record in Bed12Parser(string):
         if record.header is True:
             continue
-        records[record.name] = record
-
-    return records
+        try:
+            db.execute("INSERT INTO bed VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                       (
+                           record.chrom, record.start, record.end, record.name, record.score,
+                           record.strand, record.thick_start, record.thick_end, record.rgb,
+                           record.block_count, ",".join(str(_) for _ in record.block_sizes),
+                           ",".join(str(_) for _ in record.block_starts)
+                        ))
+        except sqlite3.InterfaceError as exc:
+            raise sqlite3.InterfaceError("{}:\n{}".format(exc,
+                                                          (
+                                                              record.chrom, record.start, record.end, record.name,
+                                                              record.score,
+                                                              record.strand, record.thick_start, record.thick_end,
+                                                              record.rgb,
+                                                              record.block_count, record.block_sizes,
+                                                              record.block_starts
+                                                          )
+                                                          ))
+        db.commit()
+        # records[record.name] = record
+    db.close()
+    # return records
 
 
 class ComparisonWorker(mp.Process):
@@ -63,7 +89,8 @@ class ComparisonWorker(mp.Process):
         self.log.propagate = False
         self.identifier = identifier
         self.name = "Comparer-{}".format(identifier)
-        self.bed12records = memoize_bed(bed12records)
+        self.bed12records = sqlite3.connect(bed12records)
+        self.__found_in_bed = set([_[0] for _ in self.bed12records.execute("SELECT name from bed")])
         self.fai = pyfaidx.Fasta(cdnas)
         self.entrance = entrance
 
@@ -78,10 +105,12 @@ class ComparisonWorker(mp.Process):
 
         t1cdna = str(self.fai[t1]).upper()
         t2cdna = str(self.fai[t2]).upper()
-        t1bed = self.bed12records[t1]
-        t2bed = self.bed12records[t2]
-        assert isinstance(t1bed, BED12)
-        assert isinstance(t2bed, BED12)
+        t1bed = BED12("\t".join([str(_) for _ in
+                                 self.bed12records.execute("SELECT * FROM bed WHERE name=?", (t1, )).fetchone()]))
+
+
+        t2bed = BED12("\t".join([str(_) for _ in
+                                 self.bed12records.execute("SELECT * FROM bed WHERE name=?", (t2, )).fetchone()]))
 
         return (t1cdna, t2cdna), (t1bed, t2bed)
 
@@ -235,7 +264,7 @@ class ComparisonWorker(mp.Process):
 
         self.log.debug("Group %s: cases %s", group, ", ".join(cases))
         for tid in cases:
-            if tid not in self.fai or tid not in self.bed12records:
+            if tid not in self.fai or tid not in self.__found_in_bed:
                 self.log.warning("%s not found among records for group %s, expunging.", tid, group)
                 to_remove.add(tid)
 
@@ -313,16 +342,20 @@ def main():
     logger = logging.getLogger("listener")
     logger.propagate = False
     log_handler = logging.StreamHandler()
-    logger.setLevel("WARNING")
+    logger.setLevel("INFO")
     log_handler.setFormatter(formatter)
     logger.addHandler(log_handler)
+    logger.info("Starting to load BED file")
+    bed_db = tempfile.mktemp(suffix="bed_database", prefix=".db", dir=os.getcwd())
+    memoize_bed(args.bed12, bed_db)
+    logger.info("Loaded BED file")
 
     writer = logging.handlers.QueueListener(logging_queue, logger)
     writer.start()
 
     send_queue = mp.Queue(-1)
 
-    procs = [ComparisonWorker(args.bed12, logging_queue, args.cdnas, send_queue, _, consider_reference=args.reference)
+    procs = [ComparisonWorker(bed_db, logging_queue, args.cdnas, send_queue, _, consider_reference=args.reference)
              for _ in range(args.threads)]
     [_.start() for _ in procs]
 
@@ -339,7 +372,7 @@ def main():
     for pos, db in enumerate(dbs):
         for num in db.execute("SELECT gid FROM summary").fetchall():
             sent[num[0]] = pos
-            
+
     print(
         *"Group T1 T1_exons T2 T2_exons Identity Recall(Exon) Precision(Exon) F1(Exon) Recall(Junction) Precision(Junction) F1(Junction) CCode".split(),
         sep="\t", file=args.detailed)
@@ -360,6 +393,5 @@ def main():
             print(group, *detail[0].split("|"), sep="\t", file=args.detailed)
         summary = db.execute("SELECT row FROM details WHERE gid=?", str(group)).fetchone()
         print(group, *summary[0].split("|"), sep="\t", file=args.out)
-
 
 main()
