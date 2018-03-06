@@ -52,10 +52,11 @@ class ComparisonWorker(mp.Process):
 
     cigar_pattern = re.compile("({})".format("|".join(list(op_consumes.keys()))))
 
-    def __init__(self, bed12records, logging_queue, cdnas, entrance, identifier):
+    def __init__(self, bed12records, logging_queue, cdnas, entrance, identifier, consider_reference=False):
 
         super().__init__()
         self.logging_queue = logging_queue
+        self.consider_reference = consider_reference
         self.handler = logging.handlers.QueueHandler(self.logging_queue)
         self.log = logging.getLogger(self.name)
         self.log.addHandler(self.handler)
@@ -156,7 +157,7 @@ class ComparisonWorker(mp.Process):
         while True:
             group, cases = self.entrance.get()
             if group == "EXIT":
-                self.log.warning("EXIT for %s", self.name)
+                self.log.debug("EXIT for %s", self.name)
                 # self.entrance.task_done()
                 self.entrance.put(("EXIT", None))
                 break
@@ -184,7 +185,7 @@ class ComparisonWorker(mp.Process):
 
         cdnas, beds = self.prepare_info(t1, t2)
         result, cigar = self.get_and_prepare_cigar(*cdnas)
-        self.log.warning("%s vs %s, CIGAR: %s", t1, t2, cigar)
+        self.log.debug("%s vs %s, CIGAR: %s", t1, t2, cigar)
         t1bed, t2bed = beds
         if t1bed.strand == "-":
             t1blocks = [0] + list(reversed(t1bed.block_sizes))
@@ -232,20 +233,24 @@ class ComparisonWorker(mp.Process):
             self.log.error("Wrong case: %s", ",".join(cases))
             return details, summary
 
-        self.log.warning("Group %s: cases %s", group, ", ".join(cases))
+        self.log.debug("Group %s: cases %s", group, ", ".join(cases))
         for tid in cases:
             if tid not in self.fai or tid not in self.bed12records:
-                self.log.warning("%s not found among records, expunging.", tid)
+                self.log.warning("%s not found among records for group %s, expunging.", tid, group)
                 to_remove.add(tid)
 
-        self.log.warning("Group %s, to remove: %s", group, ", ".join(to_remove))
         if len(cases) - len(to_remove) < 2:
-            self.log.warn("Not enough records kept for group %s; removed: %s", group, ",".join(to_remove))
+            self.log.warning("Not enough records kept for group %s; removed: %s", group, ",".join(to_remove))
             return details, summary
         [cases.remove(_) for _ in to_remove]
 
-        for comb in itertools.combinations(cases, 2):
-            self.log.warn("Combination: %s, %s", *comb)
+        if self.consider_reference is True:
+            combs = itertools.zip_longest([cases[0]], cases[1:], fillvalue=cases[0])
+        else:
+            combs = itertools.combinations(cases, 2)
+
+        for comb in combs:
+            self.log.debug("Combination: %s, %s", *comb)
             deta, result, identity = self._analyse_combination(*comb)
 
             details.append(deta)
@@ -270,6 +275,10 @@ def main():
     parser = argparse.ArgumentParser(__doc__)
     parser.add_argument("--cdnas", required=True,
                         help="FASTA file with the cDNAs to be analysed.")
+    parser.add_argument("-r", "--reference", action="store_true",
+                        default=False,
+                        help="""Flag. If set, the first element in each group is considered the 'reference'
+                        and pairwise comparisons will be performed only against this model.""")
     parser.add_argument("--groups", required=True,
                         help="Tab separated file with the groups to be analysed.")
     parser.add_argument("--bed12", required=True,
@@ -313,7 +322,7 @@ def main():
 
     send_queue = mp.Queue(-1)
 
-    procs = [ComparisonWorker(bed12records, logging_queue, args.cdnas, send_queue, _)
+    procs = [ComparisonWorker(bed12records, logging_queue, args.cdnas, send_queue, _, consider_reference=args.reference)
              for _ in range(args.threads)]
     [_.start() for _ in procs]
 
@@ -324,7 +333,7 @@ def main():
     [_.join() for _ in procs]
 
     dbs = [_.tmp_db_name for _ in procs]
-    logger.warning("DBs: {}".format(",".join(dbs)))
+    logger.debug("DBs: {}".format(",".join(dbs)))
     dbs = [sqlite3.connect(_) for _ in dbs]
     sent = dict()
     for pos, db in enumerate(dbs):
