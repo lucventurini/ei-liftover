@@ -63,7 +63,7 @@ class ComparisonWorker(mp.Process):
         self.log.propagate = False
         self.identifier = identifier
         self.name = "Comparer-{}".format(identifier)
-        self.bed12records = bed12records
+        self.bed12records = memoize_bed(bed12records)
         self.fai = pyfaidx.Fasta(cdnas)
         self.entrance = entrance
 
@@ -291,7 +291,7 @@ def main():
     log = create_default_logger("log", level="INFO")
 
     # Step 1: memorise the BED12 for fast access
-    bed12records = memoize_bed(args.bed12)
+    # bed12records = memoize_bed(args.bed12)
     # Step 2: FAI of the cDNAs
     # Step 3: for each group in the groups file, perform a pairwise comparison
 
@@ -322,7 +322,7 @@ def main():
 
     send_queue = mp.Queue(-1)
 
-    procs = [ComparisonWorker(bed12records, logging_queue, args.cdnas, send_queue, _, consider_reference=args.reference)
+    procs = [ComparisonWorker(args.bed12, logging_queue, args.cdnas, send_queue, _, consider_reference=args.reference)
              for _ in range(args.threads)]
     [_.start() for _ in procs]
 
@@ -339,8 +339,7 @@ def main():
     for pos, db in enumerate(dbs):
         for num in db.execute("SELECT gid FROM summary").fetchall():
             sent[num[0]] = pos
-    print(sent)
-
+            
     print(
         *"Group T1 T1_exons T2 T2_exons Identity Recall(Exon) Precision(Exon) F1(Exon) Recall(Junction) Precision(Junction) F1(Junction) CCode".split(),
         sep="\t", file=args.detailed)
