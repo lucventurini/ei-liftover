@@ -18,6 +18,7 @@ import multiprocessing as mp
 import sqlite3
 import tempfile
 import os
+import operator
 
 
 __doc__ = """"""
@@ -297,6 +298,61 @@ class ComparisonWorker(mp.Process):
         return details, summary
 
 
+class OutPrinter(mp.Process):
+
+    def __init__(self, name, dbnames, logging_queue, summary=False):
+        self.out_name, self.dbnames = name, dbnames
+        self.summary = summary
+        self.logging_queue = logging_queue
+        self.handler = logging.handlers.QueueHandler(self.logging_queue)
+        self.log = logging.getLogger(self.name)
+        self.log.addHandler(self.handler)
+        self.log.propagate = False
+        super().__init__()
+
+    def print_summary(self):
+        dbs = [sqlite3.connect(_) for _ in self.dbnames]
+        rows = []
+        with open(self.out_name, "wt") as out:
+            header = "Group Min(Identity) Max(Identity)".split()
+            header.extend(["Min(Junction F1)", "Max(Junction F1)"])
+            header.extend(["Min(Exon F1)", "Max(Exon F1)"])
+            header.append("IDs")
+            print(*header, file=out, sep="\t")
+            for db in dbs:
+                rows.extend(db.execute("SELECT * FROM summary").fetchall())
+                continue
+
+            for row in sorted(rows, key=operator.itemgetter(0)):
+                print(row[0], *row[1].split("|"), sep="\t", file=out)
+
+        [_.close() for _ in dbs]
+        return
+
+    def print_detailed(self):
+        dbs = [sqlite3.connect(_) for _ in self.dbnames]
+        rows = []
+        with open(self.out_name, "wt") as detailed:
+            print(
+                *"Group T1 T1_exons T2 T2_exons Identity Recall(Exon) Precision(Exon) F1(Exon) Recall(Junction) Precision(Junction) F1(Junction) CCode".split(),
+                sep="\t", file=detailed)
+            for index, group in enumerate(sorted(self.sent.keys())):
+                db = dbs[self.sent[group]]
+                details = db.execute("SELECT row FROM details WHERE gid=?", (str(group),)).fetchall()
+                for detail in details:
+                    print(group, *detail[0].split("|"), sep="\t", file=detailed)
+                if index in self.stopgaps:
+                    self.log.info("Done {}% of the summary", self.stopgaps.index(index) * 5)
+        [_.close() for _ in dbs]
+        return
+
+    def run(self):
+        if self.summary is False:
+            self.print_detailed()
+        else:
+            self.print_summary()
+
+
 def main():
 
     """"""
@@ -365,33 +421,22 @@ def main():
     send_queue.put(("EXIT", None))
     [_.join() for _ in procs]
 
-    dbs = [_.tmp_db_name for _ in procs]
-    logger.debug("DBs: {}".format(",".join(dbs)))
-    dbs = [sqlite3.connect(_) for _ in dbs]
+    logger.info("Finished performing the direct comparisons, gathering info from the SQLite databases")
+    dbnames = [_.tmp_db_name for _ in procs]
+    logger.debug("DBs: {}".format(",".join(dbnames)))
+    dbs = [sqlite3.connect(_) for _ in dbnames]
     sent = dict()
     for pos, db in enumerate(dbs):
         for num in db.execute("SELECT gid FROM summary").fetchall():
             sent[num[0]] = pos
+    [_.close() for _ in dbs]
 
-    print(
-        *"Group T1 T1_exons T2 T2_exons Identity Recall(Exon) Precision(Exon) F1(Exon) Recall(Junction) Precision(Junction) F1(Junction) CCode".split(),
-        sep="\t", file=args.detailed)
-    header = "Group Min(Identity) Max(Identity)".split()
-    header.extend(["Min(Junction F1)", "Max(Junction F1)"])
-    header.extend(["Min(Exon F1)", "Max(Exon F1)"])
-    header.append("IDs")
-    print(*header, file=args.out, sep="\t")
+    logger.info("Finished gathering info from the databases, starting to print")
+    procs = [OutPrinter(name, sent, dbnames, logging_queue, summary=s) for name, s in zip((args.out, args.detailed),
+                                                                                          (True, False))]
+    [_.start() for _ in procs]
+    [_.join() for _ in procs]
+    logger.info("Finished")
 
-    for group in groups:
-        group = int(group)
-        if group not in sent:
-            log.warning("Group %s has been lost", group)
-            continue
-        db = dbs[sent[group]]
-        details = db.execute("SELECT row FROM details WHERE gid=?", str(group)).fetchall()
-        for detail in details:
-            print(group, *detail[0].split("|"), sep="\t", file=args.detailed)
-        summary = db.execute("SELECT row FROM details WHERE gid=?", str(group)).fetchone()
-        print(group, *summary[0].split("|"), sep="\t", file=args.out)
 
 main()
