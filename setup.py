@@ -10,7 +10,9 @@ setup(
     ext_modules = cythonize([Extension(path.join("eiliftover.util.contrast"),
                                      [path.join("eiliftover", "util", "contrast.pyx")]),
                              Extension(path.join("eiliftover.util.overlap"),
-                                       [path.join("eiliftover", "util", "overlap.pyx")])
+                                       [path.join("eiliftover", "util", "overlap.pyx")]),
+                             Extension(path.join("eiliftover.alignments.cminimap"),
+                                       [path.join("eiliftover", "alignments", "cminimap.pyx")]),
                              ]),
     include_dirs=[numpy.get_include()],
     scripts=glob("util/*.py")
