@@ -4,8 +4,10 @@ import argparse
 import pyfaidx
 import parasail
 import edlib
+from Bio import Seq
 import itertools
 from Mikado.parsers.bed12 import Bed12Parser, BED12
+from Mikado.utilities.overlap import overlap
 from Mikado.utilities.log_utils import create_default_logger
 import logging
 import logging.handlers
@@ -121,7 +123,7 @@ class ComparisonWorker(mp.Process):
         # cigar_pattern = re.compile("(=|M|D|I|X|S|H)")
         result = parasail.sg_trace_scan_32(t1cdna, t2cdna, 11, 1, parasail.blosum100)
         # print(result.cigar.decode)
-        values = re.split(cls.cigar_pattern, result.cigar.decode)
+        values = re.split(cls.cigar_pattern, result.cigar.decode.decode())
         values = [(int(values[_ * 2]), values[_ * 2 + 1]) for _ in range(int((len(values) - 1) / 2))]
         return result, values
 
@@ -139,8 +141,8 @@ class ComparisonWorker(mp.Process):
 
         # Format: operation: [consumes_query, consumes_target]
         # First thing: determine the total length of the common space
-        common_length = sum(length for length, op in cigar if any(cls.op_consumes[op]))
 
+        common_length = cls.cigar_length_in_common(cigar)
         # print(common_length)
         query_array = [None] * common_length
         target_array = [None] * common_length
@@ -166,21 +168,36 @@ class ComparisonWorker(mp.Process):
                         target_array[pos] = target_pos
                 common_pos += length
 
-        c_query_exons = []
-        c_target_exons = []
-
-        for exon in query_exons:
-            # Series of tuples
-            start, end = exon
-            c_start, c_end = query_array.index(start), query_array.index(end)
-            c_query_exons.append((c_start, c_end))
-
-        for exon in target_exons:
-            start, end = exon
-            c_start, c_end = target_array.index(start), target_array.index(end)
-            c_target_exons.append((c_start, c_end))
+        try:
+            c_query_exons = cls.transfer_exons(query_exons, query_array)
+        except ValueError as exc:
+            raise ValueError("\n".join([str(_) for _ in
+                                        [query_exons, query_array]]))
+        try:
+            c_target_exons = cls.transfer_exons(target_exons, target_array)
+        except ValueError as exc:
+            raise ValueError("\n".join([str(_) for _ in
+                                        [target_exons, target_array]]))
 
         return c_query_exons, c_target_exons, list(zip(query_array, target_array))
+
+    @classmethod
+    def cigar_length_in_common(cls, cigar):
+
+        return sum(length for length, op in cigar if any(cls.op_consumes[op]))
+
+    @staticmethod
+    def transfer_exons(exons, c_array):
+        """This static method will translate one set of exons into a different coordinate system
+        (given an array that translates each position in system 1 to a position in system 2)"""
+
+        c_exons = []
+        for exon in exons:
+            start, end = exon
+            c_start, c_end = c_array.index(start), c_array.index(end)
+            c_exons.append((c_start, c_end))
+
+        return c_exons
 
     def run(self):
 
@@ -211,30 +228,22 @@ class ComparisonWorker(mp.Process):
 
         return
 
-    def _analyse_combination(self, t1, t2):
+    def _analyse_cDNAs(self, cdnas, beds):
 
-        cdnas, beds = self.prepare_info(t1, t2)
         result, cigar = self.get_and_prepare_cigar(*cdnas)
-        self.log.debug("%s vs %s, CIGAR: %s", t1, t2, cigar)
         t1bed, t2bed = beds
-        if t1bed.strand == "-":
-            t1blocks = [0] + list(reversed(t1bed.block_sizes))
-        else:
-            t1blocks = [0] + t1bed.block_sizes
-        if t2bed.strand == "-":
-            t2blocks = [0] + list(reversed(t2bed.block_sizes))
-        else:
-            t2blocks = [0] + t2bed.block_sizes
-        t1_ar = np.cumsum(t1blocks)
-        t2_ar = np.cumsum(t2blocks)
-        t1_exons = []
-        t2_exons = []
-        for pos in range(t1bed.block_count):
-            t1_exons.append((int(t1_ar[pos]), int(t1_ar[pos + 1] - 1)))
-        for pos in range(t2bed.block_count):
-            t2_exons.append((int(t2_ar[pos]), int(t2_ar[pos + 1] - 1)))
 
-        c_t1_exons, c_t2_exons, common = self.create_translation_array(cigar, t1_exons, t2_exons)
+        print(t1bed.blocks, t2bed.blocks)
+
+        try:
+            c_t1_exons, c_t2_exons, common = self.create_translation_array(cigar, t1bed.blocks, t2bed.blocks)
+        except ValueError as exc:
+            print(t1bed.blocks)
+            print(t2bed.blocks)
+            print(cigar)
+            raise ValueError(exc)
+
+        # Common: list(zip(query_array, target_array))
 
         identical = sum(length for length, op in cigar if op in ("M", "="))
         if identical == 0:
@@ -243,10 +252,52 @@ class ComparisonWorker(mp.Process):
         result = array_compare(np.ravel(np.array(c_t1_exons)),
                                np.ravel(np.array(c_t2_exons)), identity)
         result, ccode = result[:-1].reshape((2, 3)), int(result[-1])
-        deta = (t1, str(c_t1_exons), t2, str(c_t2_exons), identity,  # c_t1_exons, c_t2_exons,
+        # Now that we have analysed the cDNAs, it is time for the CDS
+
+        t1_coding_exons = [(max(t1bed.thick_start, _[0]), min(t1bed.thick_end, _[1])) for _ in t1bed.blocks
+                           if overlap(_, (t1bed.thick_start, t1bed.thick_end)) > 0]
+        assert t1_coding_exons, (t1bed.blocks, t1bed.block_starts, t1bed.block_sizes, t1bed.thick_start, t1bed.thick_end)
+        t2_coding_exons = [(max(t2bed.thick_start, _[0]), min(t2bed.thick_end, _[1])) for _ in t2bed.blocks
+                           if overlap(_, (t1bed.thick_start, t1bed.thick_end)) > 0]
+        assert t2_coding_exons
+
+        query_array, target_array = list(zip(*common))
+        c_t1_coding = self.transfer_exons(t1_coding_exons, query_array)
+        c_t2_coding = self.transfer_exons(t2_coding_exons, target_array)
+
+        t1pep = str(Seq.Seq(str(cdnas[0][t1bed.thick_start-1:t1bed.thick_end + 1])).translate())
+        t2pep = str(Seq.Seq(str(cdnas[1][t2bed.thick_start-1:t2bed.thick_end + 1])).translate())
+
+        coding_result, coding_cigar = self.get_and_prepare_cigar(t1pep, t2pep)
+        coding_common = self.cigar_length_in_common(coding_cigar)
+        coding_identical = sum(length for length, op in coding_cigar if op in ("M", "="))
+        if coding_identical == 0:
+            raise ValueError((coding_cigar, t1pep, t2pep))
+        coding_identity = round(100 * coding_identical / coding_common, 2)
+
+        print(t1_coding_exons, t2_coding_exons, c_t1_coding, c_t2_coding, sep="\n")
+
+        coding_result = array_compare(np.ravel(np.array(c_t1_coding, dtype=np.int)),
+                                      np.ravel(np.array(c_t2_coding, dtype=np.int)),
+                                      coding_identity)
+        coding_result, coding_ccode = coding_result[:-1].reshape((2, 3)), int(result[-1])
+
+        return (c_t1_exons, c_t2_exons, identity, result, ccode, coding_identity, coding_result, coding_ccode)
+
+    def _analyse_combination(self, t1, t2):
+
+        cdnas, beds = self.prepare_info(t1, t2)
+        # Get the results for the cDNAs
+        beds = [beds[0].to_transcriptomic(sequence=cdnas[0]), beds[1].to_transcriptomic(sequence=cdnas[1])]
+
+        c_t1_exons, c_t2_exons, identity, result, ccode, \
+            coding_identity, coding_result, coding_ccode = self._analyse_cDNAs(cdnas, beds)
+        # Now let's get the results for the proteins
+
+        deta = (t1, str(c_t1_exons), t2, str(c_t2_exons), identity, coding_identity, # c_t1_exons, c_t2_exons,
                 *["{:0.2f}".format(100 * _) for _ in result[0]],
                 *["{:0.2f}".format(100 * _) for _ in result[1]],
-                chr(ccode))
+                chr(ccode), chr(coding_ccode))
         deta = (str(_) for _ in deta)
 
         return deta, result, identity
@@ -334,7 +385,7 @@ class OutPrinter(mp.Process):
         rows = []
         with open(self.out_name, "wt") as detailed:
             print(
-                *"Group T1 T1_exons T2 T2_exons Identity Recall(Exon) Precision(Exon) F1(Exon) Recall(Junction) Precision(Junction) F1(Junction) CCode".split(),
+                *"Group T1 T1_exons T2 T2_exons Identity Identity(CDS) Recall(Exon) Precision(Exon) F1(Exon) Recall(Junction) Precision(Junction) F1(Junction) CCode CCode(CDS)".split(),
                 sep="\t", file=detailed)
             for index, group in enumerate(sorted(self.sent.keys())):
                 db = dbs[self.sent[group]]

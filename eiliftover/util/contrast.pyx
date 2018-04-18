@@ -2,6 +2,8 @@ import cython
 cimport numpy as np
 import numpy as np
 
+ctypedef np.int_t DTYPE_t
+
 @cython.profile(True)
 @cython.cdivision(True)
 cdef double calc_f1(double recall, double precision):
