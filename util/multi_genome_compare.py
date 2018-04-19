@@ -3,12 +3,10 @@
 import argparse
 import pyfaidx
 import parasail
-import edlib
 from Bio import Seq
 import itertools
 from Mikado.parsers.bed12 import Bed12Parser, BED12
 from Mikado.utilities.overlap import overlap
-from Mikado.utilities.log_utils import create_default_logger
 import logging
 import logging.handlers
 import re
@@ -21,9 +19,50 @@ import sqlite3
 import tempfile
 import os
 import operator
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.engine import create_engine
+from sqlalchemy import Column, Integer, Float, Text, CHAR, Index
+from sqlalchemy.orm.session import Session
 
+
+DBBASE = declarative_base()
 
 __doc__ = """"""
+
+
+class BedRec(DBBASE):
+
+    __tablename__ = "bed"
+
+    chrom = Column(Text, unique=False)
+    start = Column(Integer, unique=False)
+    end = Column(Integer, unique=False)
+    name = Column(Text, unique=True, primary_key=True)
+    bedidx = Index("bedidx", "name", unique=True)
+    score = Column(Float)
+    strand = Column(CHAR)
+    thick_start = Column(Integer)
+    thick_end = Column(Integer)
+    rgb = Column(Text)
+    count = Column(Integer)
+    sizes = Column(Text)
+    starts = Column(Text)
+
+    def __init__(self, bed: BED12):
+
+        if not isinstance(bed, BED12):
+            raise ValueError(type(bed))
+        if bed.header is True:
+            return
+
+        for attr in ["chrom", "end", "name", "score", "strand", "thick_end", "rgb"]:
+            setattr(self, attr, getattr(bed, attr))
+
+        self.start = bed.start - 1
+        self.thick_start = bed.thick_start - 1
+        self.count = bed.block_count
+        self.sizes = ",".join([str(_) for _ in bed.block_sizes])
+        self.starts = ",".join([str(_) for _ in bed.block_starts])
 
 
 def memoize_bed(string, sql):
@@ -37,32 +76,31 @@ def memoize_bed(string, sql):
     db.execute("CREATE INDEX IF NOT EXISTS bedidx ON bed(name)")
 
     # records = dict()
+    beds = []
+
+    engine = create_engine("sqlite:///{}".format(sql))
+    DBBASE.metadata.create_all(engine)
+
+    session = Session(bind=engine, autocommit=True, autoflush=True)
+
+    counter = 0
     for record in Bed12Parser(string):
         if record.header is True:
             continue
-        try:
-            db.execute("INSERT INTO bed VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                       (
-                           record.chrom, record.start -1, record.end, record.name, record.score,
-                           record.strand, record.thick_start -1, record.thick_end, record.rgb,
-                           record.block_count, ",".join(str(_) for _ in record.block_sizes),
-                           ",".join(str(_) for _ in record.block_starts)
-                        ))
-        except sqlite3.InterfaceError as exc:
-            raise sqlite3.InterfaceError("{}:\n{}".format(exc,
-                                                          (
-                                                              record.chrom, record.start, record.end, record.name,
-                                                              record.score,
-                                                              record.strand, record.thick_start, record.thick_end,
-                                                              record.rgb,
-                                                              record.block_count, record.block_sizes,
-                                                              record.block_starts
-                                                          )
-                                                          ))
-        db.commit()
-        # records[record.name] = record
-    db.close()
-    # return records
+        counter += 1
+        beds.append(BedRec(record))
+        if len(beds) > 10 ** 5:
+            session.begin(subtransactions=True)
+            session.add_all(beds)
+            session.commit()
+            beds = []
+
+    session.begin(subtransactions=True)
+    session.add_all(beds)
+    session.commit()
+    session.close()
+    res = engine.execute("select count(*) from bed").fetchone()
+    assert res[0] == counter, (res[0], counter)
 
 
 class ComparisonWorker(mp.Process):
@@ -98,10 +136,10 @@ class ComparisonWorker(mp.Process):
         self.fai = pyfaidx.Fasta(cdnas)
         self.entrance = entrance
 
-        self.tmp_db_name = tempfile.mktemp("", ".db", os.getcwd())
-        if os.path.exists(self.tmp_db_name):
-            os.remove(self.tmp_db_name)
-        self.tmp_db = sqlite3.connect(self.tmp_db_name)
+        self.tmp_db_name = tempfile.NamedTemporaryFile(suffix="", prefix=".db", dir=os.getcwd())
+        # if os.path.exists(self.tmp_db_name):
+        #     os.remove(self.tmp_db_name)
+        self.tmp_db = sqlite3.connect(self.tmp_db_name.name)
         self.tmp_db.execute("CREATE TABLE details (gid INT PRIMARY_KEY, row BLOB NOT NULL)")
         self.tmp_db.execute("CREATE TABLE summary (gid INT PRIMARY_KEY, row BLOB NOT NULL)")
 
@@ -231,7 +269,7 @@ class ComparisonWorker(mp.Process):
             continue
         self.tmp_db.commit()
         self.tmp_db.close()
-        assert os.path.exists(self.tmp_db_name)
+        assert os.path.exists(self.tmp_db_name.name)
 
         return
 
@@ -396,7 +434,7 @@ class OutPrinter(mp.Process):
         self.log.propagate = False
 
     def print_summary(self):
-        dbs = [sqlite3.connect(_) for _ in self.dbnames]
+        dbs = [sqlite3.connect(_.name) for _ in self.dbnames]
         rows = []
         with open(self.out_name, "wt") as out:
             header = "Group Min(Identity) Max(Identity)".split()
@@ -418,7 +456,7 @@ class OutPrinter(mp.Process):
         return
 
     def print_detailed(self):
-        dbs = [sqlite3.connect(_) for _ in self.dbnames]
+        dbs = [sqlite3.connect(_.name) for _ in self.dbnames]
         # rows = []
         header = "Group T1 T1_exons".split()
         header += "T2 T2_exons".split()
@@ -511,8 +549,9 @@ def main():
     log_handler.setFormatter(formatter)
     logger.addHandler(log_handler)
     logger.info("Starting to load BED file")
-    bed_db = tempfile.mktemp(suffix="bed_database", prefix=".db", dir=os.getcwd())
-    memoize_bed(args.bed12, bed_db)
+    bed_db = tempfile.NamedTemporaryFile(delete=True, suffix="bed_database", prefix=".db", dir=os.getcwd())
+    # print(bed_db)
+    memoize_bed(args.bed12, bed_db.name)
     logger.info("Loaded BED file")
 
     writer = logging.handlers.QueueListener(logging_queue, logger)
@@ -521,7 +560,7 @@ def main():
 
     send_queue = mp.Queue(-1)
 
-    procs = [ComparisonWorker(bed_db, logging_queue, args.cdnas, send_queue, _, consider_reference=args.reference)
+    procs = [ComparisonWorker(bed_db.name, logging_queue, args.cdnas, send_queue, _, consider_reference=args.reference)
              for _ in range(args.threads)]
     [_.start() for _ in procs]
 
@@ -533,8 +572,8 @@ def main():
 
     logger.info("Finished performing the direct comparisons, gathering info from the SQLite databases")
     dbnames = [_.tmp_db_name for _ in procs]
-    logger.debug("DBs: {}".format(",".join(dbnames)))
-    dbs = [sqlite3.connect(_) for _ in dbnames]
+    logger.debug("DBs: {}".format(",".join([_.name for _ in dbnames])))
+    dbs = [sqlite3.connect(_.name) for _ in dbnames]
     sent = dict()
     for pos, db in enumerate(dbs):
         for num in db.execute("SELECT gid FROM summary").fetchall():
