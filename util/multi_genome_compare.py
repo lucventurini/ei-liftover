@@ -43,8 +43,8 @@ def memoize_bed(string, sql):
         try:
             db.execute("INSERT INTO bed VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                        (
-                           record.chrom, record.start, record.end, record.name, record.score,
-                           record.strand, record.thick_start, record.thick_end, record.rgb,
+                           record.chrom, record.start -1, record.end, record.name, record.score,
+                           record.strand, record.thick_start -1, record.thick_end, record.rgb,
                            record.block_count, ",".join(str(_) for _ in record.block_sizes),
                            ",".join(str(_) for _ in record.block_starts)
                         ))
@@ -90,6 +90,7 @@ class ComparisonWorker(mp.Process):
         self.log = logging.getLogger(self.name)
         self.log.addHandler(self.handler)
         self.log.propagate = False
+        self.log.setLevel("DEBUG")
         self.identifier = identifier
         self.name = "Comparer-{}".format(identifier)
         self.bed12records = sqlite3.connect(bed12records)
@@ -121,7 +122,7 @@ class ComparisonWorker(mp.Process):
     def get_and_prepare_cigar(cls, t1cdna, t2cdna):
 
         # cigar_pattern = re.compile("(=|M|D|I|X|S|H)")
-        result = parasail.sg_trace_scan_32(t1cdna, t2cdna, 11, 1, parasail.blosum100)
+        result = parasail.sg_trace_scan_32(t1cdna, t2cdna, 11, 1, parasail.blosum62)
         # print(result.cigar.decode)
         values = re.split(cls.cigar_pattern, result.cigar.decode.decode())
         values = [(int(values[_ * 2]), values[_ * 2 + 1]) for _ in range(int((len(values) - 1) / 2))]
@@ -151,8 +152,8 @@ class ComparisonWorker(mp.Process):
         # We will do this by creating "exons" derived from the alignment
 
         common_pos = 0
-        query_pos = -1
-        target_pos = -1
+        query_pos = 0
+        target_pos = 0
 
         for length, op in cigar:
             consumes_query, consumes_target = cls.op_consumes[op]
@@ -168,16 +169,21 @@ class ComparisonWorker(mp.Process):
                         target_array[pos] = target_pos
                 common_pos += length
 
+        for pos in range(1, query_exons[-1][1] + 1):
+            assert pos in query_array, (pos, min([_ for _ in query_array if _ is not None]), max([_ for _ in query_array if _ is not None]))
+        for pos in range(1, target_exons[-1][1] + 1):
+            assert pos in target_array
+
         try:
             c_query_exons = cls.transfer_exons(query_exons, query_array)
         except ValueError as exc:
             raise ValueError("\n".join([str(_) for _ in
-                                        [query_exons, query_array]]))
+                                        [query_exons, query_array, cigar, exc]]))
         try:
             c_target_exons = cls.transfer_exons(target_exons, target_array)
         except ValueError as exc:
             raise ValueError("\n".join([str(_) for _ in
-                                        [target_exons, target_array]]))
+                                        [target_exons, target_array, cigar, exc]]))
 
         return c_query_exons, c_target_exons, list(zip(query_array, target_array))
 
@@ -194,7 +200,8 @@ class ComparisonWorker(mp.Process):
         c_exons = []
         for exon in exons:
             start, end = exon
-            c_start, c_end = c_array.index(start), c_array.index(end)
+            c_start = c_array.index(start)
+            c_end = c_array.index(end)
             c_exons.append((c_start, c_end))
 
         return c_exons
@@ -231,16 +238,15 @@ class ComparisonWorker(mp.Process):
     def _analyse_cDNAs(self, cdnas, beds):
 
         result, cigar = self.get_and_prepare_cigar(*cdnas)
+
         t1bed, t2bed = beds
 
-        print(t1bed.blocks, t2bed.blocks)
+        assert sorted(t1bed.blocks)[-1][1] == len(cdnas[0]), (t1bed.blocks, len(cdnas[0]))
+        assert sorted(t2bed.blocks)[-1][1] == len(cdnas[1]), (t2bed.blocks, len(cdnas[1]))
 
         try:
             c_t1_exons, c_t2_exons, common = self.create_translation_array(cigar, t1bed.blocks, t2bed.blocks)
-        except ValueError as exc:
-            print(t1bed.blocks)
-            print(t2bed.blocks)
-            print(cigar)
+        except (ValueError, AssertionError) as exc:
             raise ValueError(exc)
 
         # Common: list(zip(query_array, target_array))
@@ -254,19 +260,30 @@ class ComparisonWorker(mp.Process):
         result, ccode = result[:-1].reshape((2, 3)), int(result[-1])
         # Now that we have analysed the cDNAs, it is time for the CDS
 
-        t1_coding_exons = [(max(t1bed.thick_start, _[0]), min(t1bed.thick_end, _[1])) for _ in t1bed.blocks
-                           if overlap(_, (t1bed.thick_start, t1bed.thick_end)) > 0]
+        t1_coding_exons = [(max(t1bed.thick_start - 1, _[0]), min(t1bed.thick_end, _[1])) for _ in t1bed.blocks
+                           if overlap(_, (t1bed.thick_start - 1, t1bed.thick_end)) > 0]
         assert t1_coding_exons, (t1bed.blocks, t1bed.block_starts, t1bed.block_sizes, t1bed.thick_start, t1bed.thick_end)
-        t2_coding_exons = [(max(t2bed.thick_start, _[0]), min(t2bed.thick_end, _[1])) for _ in t2bed.blocks
-                           if overlap(_, (t1bed.thick_start, t1bed.thick_end)) > 0]
+        t2_coding_exons = [(max(t2bed.thick_start - 1, _[0]), min(t2bed.thick_end, _[1])) for _ in t2bed.blocks
+                           if overlap(_, (t2bed.thick_start - 1, t2bed.thick_end)) > 0]
         assert t2_coding_exons
 
         query_array, target_array = list(zip(*common))
         c_t1_coding = self.transfer_exons(t1_coding_exons, query_array)
         c_t2_coding = self.transfer_exons(t2_coding_exons, target_array)
 
-        t1pep = str(Seq.Seq(str(cdnas[0][t1bed.thick_start-1:t1bed.thick_end + 1])).translate())
-        t2pep = str(Seq.Seq(str(cdnas[1][t2bed.thick_start-1:t2bed.thick_end + 1])).translate())
+        if t1bed.name == "TraesCS7A01G235400.1":
+            assert t1bed.thick_start == 39, t1bed
+        elif t1bed.name == "TraesCS7B01G133600.1":
+            assert t1bed.thick_start == 86
+
+        t1pep = str(Seq.Seq(str(cdnas[0][max(0, t1bed.thick_start - 1):t1bed.thick_end])).translate())
+        self.log.debug("CDS: %s:%s-%s: %s",
+                       t1bed.chrom, t1bed.thick_start-2, t1bed.thick_end, t1pep)
+
+        t2pep = str(Seq.Seq(str(cdnas[1][max(0, t2bed.thick_start - 1):t2bed.thick_end])).translate())
+        self.log.debug("CDS: %s:%s-%s: %s",
+                       t2bed.chrom, t2bed.thick_start - 2, t2bed.thick_end, t2pep)
+        # print(t2bed.chrom, t2bed.thick_start-2, t2bed.thick_end, t2_coding_exons, t2pep)
 
         coding_result, coding_cigar = self.get_and_prepare_cigar(t1pep, t2pep)
         coding_common = self.cigar_length_in_common(coding_cigar)
@@ -275,14 +292,13 @@ class ComparisonWorker(mp.Process):
             raise ValueError((coding_cigar, t1pep, t2pep))
         coding_identity = round(100 * coding_identical / coding_common, 2)
 
-        print(t1_coding_exons, t2_coding_exons, c_t1_coding, c_t2_coding, sep="\n")
-
         coding_result = array_compare(np.ravel(np.array(c_t1_coding, dtype=np.int)),
                                       np.ravel(np.array(c_t2_coding, dtype=np.int)),
                                       coding_identity)
-        coding_result, coding_ccode = coding_result[:-1].reshape((2, 3)), int(result[-1])
+        coding_result, coding_ccode = coding_result[:-1].reshape((2, 3)), int(coding_result[-1])
 
-        return (c_t1_exons, c_t2_exons, identity, result, ccode, coding_identity, coding_result, coding_ccode)
+        return (c_t1_exons, c_t2_exons, identity, result, ccode,
+                c_t1_coding, c_t2_coding, coding_identity, coding_result, coding_ccode)
 
     def _analyse_combination(self, t1, t2):
 
@@ -291,22 +307,30 @@ class ComparisonWorker(mp.Process):
         beds = [beds[0].to_transcriptomic(sequence=cdnas[0]), beds[1].to_transcriptomic(sequence=cdnas[1])]
 
         c_t1_exons, c_t2_exons, identity, result, ccode, \
-            coding_identity, coding_result, coding_ccode = self._analyse_cDNAs(cdnas, beds)
+            c_t1_coding, c_t2_coding, coding_identity, coding_result, coding_ccode = self._analyse_cDNAs(cdnas, beds)
         # Now let's get the results for the proteins
 
-        deta = (t1, str(c_t1_exons), t2, str(c_t2_exons), identity, coding_identity, # c_t1_exons, c_t2_exons,
+        deta = (t1, str(c_t1_exons), t2, str(c_t2_exons), identity,  # c_t1_exons, c_t2_exons,
                 *["{:0.2f}".format(100 * _) for _ in result[0]],
                 *["{:0.2f}".format(100 * _) for _ in result[1]],
-                chr(ccode), chr(coding_ccode))
+                chr(ccode),
+                c_t1_coding, c_t2_coding,
+                coding_identity,
+                *["{:0.2f}".format(100 * _) for _ in coding_result[0]],
+                *["{:0.2f}".format(100 * _) for _ in coding_result[1]],
+                chr(coding_ccode))
         deta = (str(_) for _ in deta)
 
-        return deta, result, identity
+        return deta, result, identity, coding_result, coding_identity
 
     def analyse_group(self, group, cases):
 
         exon_f1 = []
         junc_f1 = []
+        cds_f1 = []
+        cds_junc_f1 = []
         iden = []
+        cds_iden = []
         details, summary = [], None
 
         to_remove = set()
@@ -332,34 +356,44 @@ class ComparisonWorker(mp.Process):
 
         for comb in combs:
             self.log.debug("Combination: %s, %s", *comb)
-            deta, result, identity = self._analyse_combination(*comb)
+            deta, result, identity, coding_result, coding_identity = self._analyse_combination(*comb)
 
             details.append(deta)
             exon_f1.append(result[0][2])
             junc_f1.append(result[1][2])
+            cds_f1.append(coding_result[0][2])
+            cds_junc_f1.append(coding_result[1][2])
             iden.append(identity)
+            cds_iden.append(coding_identity)
 
         summary = ("{:0.2f}".format(min(100 * iden)),
-                   "{:0.2f}".format(max(iden)),
+                   "{:0.2f}".format(max(100 * iden)),
                    "{:0.2f}".format(min(junc_f1)),
                    "{:0.2f}".format(max(junc_f1)),
                    "{:0.2f}".format(min(exon_f1)),
                    "{:0.2f}".format(max(exon_f1)),
+                   "{:0.2f}".format(min(100 * cds_iden)),
+                   "{:0.2f}".format(max(100 * cds_iden)),
+                   "{:0.2f}".format(min(cds_junc_f1)),
+                   "{:0.2f}".format(max(cds_junc_f1)),
+                   "{:0.2f}".format(min(cds_f1)),
+                   "{:0.2f}".format(max(cds_f1)),
                    ",".join(cases))
         return details, summary
 
 
 class OutPrinter(mp.Process):
 
-    def __init__(self, name, dbnames, logging_queue, summary=False):
+    def __init__(self, name, sent, dbnames, logging_queue, summary=False):
         self.out_name, self.dbnames = name, dbnames
         self.summary = summary
         self.logging_queue = logging_queue
+        super().__init__()
+        self.sent = sent
+        self.log = logging.getLogger(self._name)
         self.handler = logging.handlers.QueueHandler(self.logging_queue)
-        self.log = logging.getLogger(self.name)
         self.log.addHandler(self.handler)
         self.log.propagate = False
-        super().__init__()
 
     def print_summary(self):
         dbs = [sqlite3.connect(_) for _ in self.dbnames]
@@ -368,6 +402,9 @@ class OutPrinter(mp.Process):
             header = "Group Min(Identity) Max(Identity)".split()
             header.extend(["Min(Junction F1)", "Max(Junction F1)"])
             header.extend(["Min(Exon F1)", "Max(Exon F1)"])
+            header.extend("Min(CDS_Identity) Max(CDS_Identity)".split())
+            header.extend(["Min(CDS Junction F1)", "Max(CDS Junction F1)"])
+            header.extend(["Min(CDS Exon F1)", "Max(CDS Exon F1)"])
             header.append("IDs")
             print(*header, file=out, sep="\t")
             for db in dbs:
@@ -382,18 +419,30 @@ class OutPrinter(mp.Process):
 
     def print_detailed(self):
         dbs = [sqlite3.connect(_) for _ in self.dbnames]
-        rows = []
+        # rows = []
+        header = "Group T1 T1_exons".split()
+        header += "T2 T2_exons".split()
+        header += ["Identity"]
+        header += ["{}(Exon)".format(_) for _ in ["Recall", "Precision", "F1"]]
+        header += ["{}(Junction)".format(_) for _ in ["Recall", "Precision", "F1"]]
+        header += ["CCode"]
+        header += ["T1_exons(CDS)", "T2_exons(CDS)"]
+        header += ["Identity(CDS)"]
+        header += ["{}(CDS,Exon)".format(_) for _ in ["Recall", "Precision", "F1"]]
+        header += ["{}(CDS,Junction)".format(_) for _ in ["Recall", "Precision", "F1"]]
+        header += ["CCode(CDS)"]
+
         with open(self.out_name, "wt") as detailed:
             print(
-                *"Group T1 T1_exons T2 T2_exons Identity Identity(CDS) Recall(Exon) Precision(Exon) F1(Exon) Recall(Junction) Precision(Junction) F1(Junction) CCode CCode(CDS)".split(),
+                *header,
                 sep="\t", file=detailed)
             for index, group in enumerate(sorted(self.sent.keys())):
                 db = dbs[self.sent[group]]
                 details = db.execute("SELECT row FROM details WHERE gid=?", (str(group),)).fetchall()
                 for detail in details:
                     print(group, *detail[0].split("|"), sep="\t", file=detailed)
-                if index in self.stopgaps:
-                    self.log.info("Done {}% of the summary", self.stopgaps.index(index) * 5)
+                # if index in self.stopgaps:
+                #     self.log.info("Done {}% of the summary", self.stopgaps.index(index) * 5)
         [_.close() for _ in dbs]
         return
 
@@ -417,6 +466,9 @@ def main():
                         and pairwise comparisons will be performed only against this model.""")
     parser.add_argument("--groups", required=True,
                         help="Tab separated file with the groups to be analysed.")
+    verbosity = parser.add_mutually_exclusive_group()
+    verbosity.add_argument("-q", "--quiet", default=False, action="store_true")
+    verbosity.add_argument("-v", "--verbose", default=False, action="store_true")
     parser.add_argument("--bed12", required=True,
                         help="BED12 file with the coordinates of the models to analyse.")
     parser.add_argument("-d", "--detailed", type=argparse.FileType("wt"), required=True)
@@ -424,7 +476,7 @@ def main():
     parser.add_argument("-o", "--out", default=sys.stdout, type=argparse.FileType("wt"), required=True)
     args = parser.parse_args()
 
-    log = create_default_logger("log", level="INFO")
+    # log = create_default_logger("log", level="INFO")
 
     # Step 1: memorise the BED12 for fast access
     # bed12records = memoize_bed(args.bed12)
@@ -449,7 +501,13 @@ def main():
     logger = logging.getLogger("listener")
     logger.propagate = False
     log_handler = logging.StreamHandler()
-    logger.setLevel("INFO")
+    if args.verbose:
+        level = "DEBUG"
+    elif args.quiet:
+        level = "WARNING"
+    else:
+        level = "INFO"
+    logger.setLevel(level)
     log_handler.setFormatter(formatter)
     logger.addHandler(log_handler)
     logger.info("Starting to load BED file")
@@ -458,6 +516,7 @@ def main():
     logger.info("Loaded BED file")
 
     writer = logging.handlers.QueueListener(logging_queue, logger)
+    writer.respect_handler_level = True
     writer.start()
 
     send_queue = mp.Queue(-1)
@@ -483,7 +542,7 @@ def main():
     [_.close() for _ in dbs]
 
     logger.info("Finished gathering info from the databases, starting to print")
-    procs = [OutPrinter(name, sent, dbnames, logging_queue, summary=s) for name, s in zip((args.out, args.detailed),
+    procs = [OutPrinter(name, sent, dbnames, logging_queue, summary=s) for name, s in zip((args.out.name, args.detailed.name),
                                                                                           (True, False))]
     [_.start() for _ in procs]
     [_.join() for _ in procs]
