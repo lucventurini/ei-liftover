@@ -32,7 +32,7 @@ __doc__ = """"""
 
 class BedRec(DBBASE):
 
-    __tablename__ = "bed"
+    __tablename__ = "bed_records"
 
     chrom = Column(Text, unique=False)
     start = Column(Integer, unique=False)
@@ -65,6 +65,19 @@ class BedRec(DBBASE):
         self.starts = ",".join([str(_) for _ in bed.block_starts])
 
 
+class BedIndex(DBBASE):
+
+    __tablename__ = "bed"
+    name = Column(Text, unique=True, primary_key=True)
+    nidx = Index("sidx", "name", unique=True)
+    start = Column(Integer)
+    # end = Column(Integer)
+
+    def __init__(self, name, start):
+
+        self.name, self.start = name, start
+
+        
 def memoize_bed(string, sql):
 
     """Function to memoize a BED12 file for fast access"""
@@ -84,16 +97,20 @@ def memoize_bed(string, sql):
     session = Session(bind=engine, autocommit=True, autoflush=True)
 
     counter = 0
-    for record in Bed12Parser(string):
-        if record.header is True:
-            continue
-        counter += 1
-        beds.append(BedRec(record))
-        if len(beds) > 10 ** 5:
-            session.begin(subtransactions=True)
-            session.add_all(beds)
-            session.commit()
-            beds = []
+    with open(string, "rb") as parser:
+        pos = parser.tell()  # This will be 0 as we are at the beginning
+        for line in parser:
+            record = BED12(line.decode())
+            if not record.header:
+                beds.append(BedIndex(record.name, pos))
+                counter += 1
+            pos += len(line)
+
+            if len(beds) > 10 ** 5:
+                session.begin(subtransactions=True)
+                session.add_all(beds)
+                session.commit()
+                beds = []
 
     session.begin(subtransactions=True)
     session.add_all(beds)
@@ -119,7 +136,7 @@ class ComparisonWorker(mp.Process):
 
     cigar_pattern = re.compile("({})".format("|".join(list(op_consumes.keys()))))
 
-    def __init__(self, bed12records, logging_queue, cdnas, entrance, identifier, consider_reference=False):
+    def __init__(self, bed12records, bedfile, logging_queue, cdnas, entrance, identifier, consider_reference=False):
 
         super().__init__()
         self.logging_queue = logging_queue
@@ -132,29 +149,26 @@ class ComparisonWorker(mp.Process):
         self.identifier = identifier
         self.name = "Comparer-{}".format(identifier)
         self.bed12records = sqlite3.connect(bed12records)
-        self.__found_in_bed = set([_[0] for _ in self.bed12records.execute("SELECT name from bed")])
+        self.__found_in_bed = dict(_ for _ in self.bed12records.execute("SELECT name, start from bed"))
+        self.bedfile = open(bedfile, "rt")
         self.fai = pyfaidx.Fasta(cdnas)
         self.entrance = entrance
 
         self.tmp_db_name = tempfile.NamedTemporaryFile(suffix="", prefix=".db", dir=os.getcwd())
-        # if os.path.exists(self.tmp_db_name):
-        #     os.remove(self.tmp_db_name)
         self.tmp_db = sqlite3.connect(self.tmp_db_name.name)
         self.tmp_db.execute("CREATE TABLE details (gid INT PRIMARY_KEY, row BLOB NOT NULL)")
         self.tmp_db.execute("CREATE TABLE summary (gid INT PRIMARY_KEY, row BLOB NOT NULL)")
 
-    def prepare_info(self, t1, t2):
+    def prepare_info(self, transcript):
 
-        t1cdna = str(self.fai[t1]).upper()
-        t2cdna = str(self.fai[t2]).upper()
-        t1bed = BED12("\t".join([str(_) for _ in
-                                 self.bed12records.execute("SELECT * FROM bed WHERE name=?", (t1, )).fetchone()]))
-
-
-        t2bed = BED12("\t".join([str(_) for _ in
-                                 self.bed12records.execute("SELECT * FROM bed WHERE name=?", (t2, )).fetchone()]))
-
-        return (t1cdna, t2cdna), (t1bed, t2bed)
+        cdna = str(self.fai[transcript]).upper()
+        bed_position = self.__found_in_bed[transcript]
+        self.bedfile.seek(bed_position)
+        bed = BED12(self.bedfile.readline())
+        assert bed.name == transcript, (bed.name, transcript, bed_position)
+        bed = bed.to_transcriptomic(sequence=cdna)
+        pep = str(Seq.Seq(str(cdna[max(0, bed.thick_start - 1):bed.thick_end])).translate())
+        return cdna, bed, pep
 
     @classmethod
     def get_and_prepare_cigar(cls, t1cdna, t2cdna):
@@ -273,7 +287,7 @@ class ComparisonWorker(mp.Process):
 
         return
 
-    def _analyse_cDNAs(self, cdnas, beds):
+    def _analyse_cDNAs(self, cdnas, beds, peps):
 
         result, cigar = self.get_and_prepare_cigar(*cdnas)
 
@@ -309,16 +323,12 @@ class ComparisonWorker(mp.Process):
         c_t1_coding = self.transfer_exons(t1_coding_exons, query_array)
         c_t2_coding = self.transfer_exons(t2_coding_exons, target_array)
 
-        if t1bed.name == "TraesCS7A01G235400.1":
-            assert t1bed.thick_start == 39, t1bed
-        elif t1bed.name == "TraesCS7B01G133600.1":
-            assert t1bed.thick_start == 86
+        t1pep, t2pep = peps
+        # t1pep = str(Seq.Seq(str(cdnas[0][max(0, t1bed.thick_start - 1):t1bed.thick_end])).translate())
+        # self.log.debug("CDS: %s:%s-%s: %s",
+        #                t1bed.chrom, t1bed.thick_start-2, t1bed.thick_end, t1pep)
 
-        t1pep = str(Seq.Seq(str(cdnas[0][max(0, t1bed.thick_start - 1):t1bed.thick_end])).translate())
-        self.log.debug("CDS: %s:%s-%s: %s",
-                       t1bed.chrom, t1bed.thick_start-2, t1bed.thick_end, t1pep)
-
-        t2pep = str(Seq.Seq(str(cdnas[1][max(0, t2bed.thick_start - 1):t2bed.thick_end])).translate())
+        # t2pep = str(Seq.Seq(str(cdnas[1][max(0, t2bed.thick_start - 1):t2bed.thick_end])).translate())
         self.log.debug("CDS: %s:%s-%s: %s",
                        t2bed.chrom, t2bed.thick_start - 2, t2bed.thick_end, t2pep)
         # print(t2bed.chrom, t2bed.thick_start-2, t2bed.thick_end, t2_coding_exons, t2pep)
@@ -340,12 +350,14 @@ class ComparisonWorker(mp.Process):
 
     def _analyse_combination(self, t1, t2):
 
-        cdnas, beds = self.prepare_info(t1, t2)
+        cdnas, beds, peps = list(zip(t1, t2))  
+
+        
         # Get the results for the cDNAs
-        beds = [beds[0].to_transcriptomic(sequence=cdnas[0]), beds[1].to_transcriptomic(sequence=cdnas[1])]
+        # beds = [beds[0].to_transcriptomic(sequence=cdnas[0]), beds[1].to_transcriptomic(sequence=cdnas[1])]
 
         c_t1_exons, c_t2_exons, identity, result, ccode, \
-            c_t1_coding, c_t2_coding, coding_identity, coding_result, coding_ccode = self._analyse_cDNAs(cdnas, beds)
+            c_t1_coding, c_t2_coding, coding_identity, coding_result, coding_ccode = self._analyse_cDNAs(cdnas, beds, peps)
         # Now let's get the results for the proteins
 
         deta = (t1, str(c_t1_exons), t2, str(c_t2_exons), identity,  # c_t1_exons, c_t2_exons,
@@ -387,14 +399,18 @@ class ComparisonWorker(mp.Process):
             return details, summary
         [cases.remove(_) for _ in to_remove]
 
+        data = dict()
+        for name in cases:
+            data[name] = self.prepare_info(name)
+
         if self.consider_reference is True:
             combs = itertools.zip_longest([cases[0]], cases[1:], fillvalue=cases[0])
         else:
             combs = itertools.combinations(cases, 2)
-
+        
         for comb in combs:
             self.log.debug("Combination: %s, %s", *comb)
-            deta, result, identity, coding_result, coding_identity = self._analyse_combination(*comb)
+            deta, result, identity, coding_result, coding_identity = self._analyse_combination(data[comb[0]], data[comb[1]])
 
             details.append(deta)
             exon_f1.append(result[0][2])
@@ -560,7 +576,7 @@ def main():
 
     send_queue = mp.Queue(-1)
 
-    procs = [ComparisonWorker(bed_db.name, logging_queue, args.cdnas, send_queue, _, consider_reference=args.reference)
+    procs = [ComparisonWorker(bed_db.name, args.bed12, logging_queue, args.cdnas, send_queue, _, consider_reference=args.reference)
              for _ in range(args.threads)]
     [_.start() for _ in procs]
 
