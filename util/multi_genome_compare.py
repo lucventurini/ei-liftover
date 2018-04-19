@@ -100,9 +100,15 @@ def memoize_bed(string, sql):
     with open(string, "rb") as parser:
         pos = parser.tell()  # This will be 0 as we are at the beginning
         for line in parser:
-            record = BED12(line.decode())
-            if not record.header:
-                beds.append(BedIndex(record.name, pos))
+            fields = line.decode().split("\t")
+            if len(fields) != 12 or (fields and fields[0][0] == "#"):
+                header = True
+            else:
+                header = False
+            
+            # record = BED12(line.decode())
+            if not header:
+                beds.append(BedIndex(fields[3], pos))
                 counter += 1
             pos += len(line)
 
@@ -149,7 +155,7 @@ class ComparisonWorker(mp.Process):
         self.identifier = identifier
         self.name = "Comparer-{}".format(identifier)
         self.bed12records = sqlite3.connect(bed12records)
-        self.__found_in_bed = dict(_ for _ in self.bed12records.execute("SELECT name, start from bed"))
+        self.__found_in_bed = dict()
         self.bedfile = open(bedfile, "rt")
         self.fai = pyfaidx.Fasta(cdnas)
         self.entrance = entrance
@@ -260,6 +266,8 @@ class ComparisonWorker(mp.Process):
 
     def run(self):
 
+        self.__found_in_bed = dict(_ for _ in self.bed12records.execute("SELECT name, start from bed"))
+        
         while True:
             group, cases = self.entrance.get()
             if group == "EXIT":
@@ -351,7 +359,7 @@ class ComparisonWorker(mp.Process):
     def _analyse_combination(self, t1, t2):
 
         cdnas, beds, peps = list(zip(t1, t2))  
-
+        t1, t2 = beds[0].name, beds[1].name        
         
         # Get the results for the cDNAs
         # beds = [beds[0].to_transcriptomic(sequence=cdnas[0]), beds[1].to_transcriptomic(sequence=cdnas[1])]
