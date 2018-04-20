@@ -100,19 +100,18 @@ def memoize_bed(string, sql):
     with open(string, "rb") as parser:
         pos = parser.tell()  # This will be 0 as we are at the beginning
         for line in parser:
-            fields = line.decode().split("\t")
-            if len(fields) != 12 or (fields and fields[0][0] == "#"):
+            fields = line.split(b"\t")
+            if len(fields) != 12 or (fields and fields[0][0] == b"#"):
                 header = True
             else:
                 header = False
             
-            # record = BED12(line.decode())
             if not header:
-                beds.append(BedIndex(fields[3], pos))
+                beds.append(BedIndex(fields[3].decode(), pos))
                 counter += 1
             pos += len(line)
 
-            if len(beds) > 10 ** 5:
+            if len(beds) > 10 ** 6:
                 session.begin(subtransactions=True)
                 session.add_all(beds)
                 session.commit()
