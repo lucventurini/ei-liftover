@@ -157,9 +157,9 @@ class ComparisonWorker(mp.Process):
         self.bed12records = sqlite3.connect(bed12records)
         self.__found_in_bed = dict()
         self.bedfile = open(bedfile, "rt")
-        self.fai = pyfaidx.Fasta(cdnas)
         self.entrance = entrance
-
+        self.cdnas = cdnas
+        
         self.tmp_db_name = tempfile.NamedTemporaryFile(suffix="", prefix=".db", dir=os.getcwd())
         self.tmp_db = sqlite3.connect(self.tmp_db_name.name)
         self.tmp_db.execute("CREATE TABLE details (gid INT PRIMARY_KEY, row BLOB NOT NULL)")
@@ -267,6 +267,8 @@ class ComparisonWorker(mp.Process):
     def run(self):
 
         self.__found_in_bed = dict(_ for _ in self.bed12records.execute("SELECT name, start from bed"))
+        self.fai = pyfaidx.Fasta(self.cdnas)
+        self.log.debug("Finished loading information for the process")
         
         while True:
             group, cases = self.entrance.get()
