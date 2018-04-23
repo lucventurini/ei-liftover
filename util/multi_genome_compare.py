@@ -30,41 +30,6 @@ DBBASE = declarative_base()
 __doc__ = """"""
 
 
-class BedRec(DBBASE):
-
-    __tablename__ = "bed_records"
-
-    chrom = Column(Text, unique=False)
-    start = Column(Integer, unique=False)
-    end = Column(Integer, unique=False)
-    name = Column(Text, unique=True, primary_key=True)
-    bedidx = Index("bedidx", "name", unique=True)
-    score = Column(Float)
-    strand = Column(CHAR)
-    thick_start = Column(Integer)
-    thick_end = Column(Integer)
-    rgb = Column(Text)
-    count = Column(Integer)
-    sizes = Column(Text)
-    starts = Column(Text)
-
-    def __init__(self, bed: BED12):
-
-        if not isinstance(bed, BED12):
-            raise ValueError(type(bed))
-        if bed.header is True:
-            return
-
-        for attr in ["chrom", "end", "name", "score", "strand", "thick_end", "rgb"]:
-            setattr(self, attr, getattr(bed, attr))
-
-        self.start = bed.start - 1
-        self.thick_start = bed.thick_start - 1
-        self.count = bed.block_count
-        self.sizes = ",".join([str(_) for _ in bed.block_sizes])
-        self.starts = ",".join([str(_) for _ in bed.block_starts])
-
-
 class BedIndex(DBBASE):
 
     __tablename__ = "bed"
@@ -105,9 +70,13 @@ def memoize_bed(string, sql):
                 header = True
             else:
                 header = False
-            
+
             if not header:
-                beds.append(BedIndex(fields[3].decode(), pos))
+                name = fields[3].decode()
+                if "ID=" in name:
+                    groups = dict(re.findall("([^(;|=)]*)=([^;]*)", name))
+                    name = groups["ID"]
+                beds.append(BedIndex(name, pos))
                 counter += 1
             pos += len(line)
 
@@ -321,38 +290,44 @@ class ComparisonWorker(mp.Process):
         result, ccode = result[:-1].reshape((2, 3)), int(result[-1])
         # Now that we have analysed the cDNAs, it is time for the CDS
 
-        t1_coding_exons = [(max(t1bed.thick_start - 1, _[0]), min(t1bed.thick_end, _[1])) for _ in t1bed.blocks
-                           if overlap(_, (t1bed.thick_start - 1, t1bed.thick_end)) > 0]
-        assert t1_coding_exons, (t1bed.blocks, t1bed.block_starts, t1bed.block_sizes, t1bed.thick_start, t1bed.thick_end)
-        t2_coding_exons = [(max(t2bed.thick_start - 1, _[0]), min(t2bed.thick_end, _[1])) for _ in t2bed.blocks
-                           if overlap(_, (t2bed.thick_start - 1, t2bed.thick_end)) > 0]
-        assert t2_coding_exons
+        if t1bed.coding and t2bed.coding:
 
-        query_array, target_array = list(zip(*common))
-        c_t1_coding = self.transfer_exons(t1_coding_exons, query_array)
-        c_t2_coding = self.transfer_exons(t2_coding_exons, target_array)
+            t1_coding_exons = [(max(t1bed.thick_start - 1, _[0]), min(t1bed.thick_end, _[1])) for _ in t1bed.blocks
+                               if overlap(_, (t1bed.thick_start - 1, t1bed.thick_end)) > 0]
+            assert t1_coding_exons, (
+            t1bed.blocks, t1bed.block_starts, t1bed.block_sizes, t1bed.thick_start, t1bed.thick_end)
+            t2_coding_exons = [(max(t2bed.thick_start - 1, _[0]), min(t2bed.thick_end, _[1])) for _ in t2bed.blocks
+                               if overlap(_, (t2bed.thick_start - 1, t2bed.thick_end)) > 0]
+            assert t2_coding_exons
 
-        t1pep, t2pep = peps
-        # t1pep = str(Seq.Seq(str(cdnas[0][max(0, t1bed.thick_start - 1):t1bed.thick_end])).translate())
-        # self.log.debug("CDS: %s:%s-%s: %s",
-        #                t1bed.chrom, t1bed.thick_start-2, t1bed.thick_end, t1pep)
+            query_array, target_array = list(zip(*common))
+            c_t1_coding = self.transfer_exons(t1_coding_exons, query_array)
+            c_t2_coding = self.transfer_exons(t2_coding_exons, target_array)
 
-        # t2pep = str(Seq.Seq(str(cdnas[1][max(0, t2bed.thick_start - 1):t2bed.thick_end])).translate())
-        self.log.debug("CDS: %s:%s-%s: %s",
-                       t2bed.chrom, t2bed.thick_start - 2, t2bed.thick_end, t2pep)
-        # print(t2bed.chrom, t2bed.thick_start-2, t2bed.thick_end, t2_coding_exons, t2pep)
+            t1pep, t2pep = peps
 
-        coding_result, coding_cigar = self.get_and_prepare_cigar(t1pep, t2pep)
-        coding_common = self.cigar_length_in_common(coding_cigar)
-        coding_identical = sum(length for length, op in coding_cigar if op in ("M", "="))
-        if coding_identical == 0:
-            raise ValueError((coding_cigar, t1pep, t2pep))
-        coding_identity = round(100 * coding_identical / coding_common, 2)
+            self.log.debug("CDS: %s:%s-%s: %s",
+                           t2bed.chrom, t2bed.thick_start - 2, t2bed.thick_end, t2pep)
+            # print(t2bed.chrom, t2bed.thick_start-2, t2bed.thick_end, t2_coding_exons, t2pep)
 
-        coding_result = array_compare(np.ravel(np.array(c_t1_coding, dtype=np.int)),
-                                      np.ravel(np.array(c_t2_coding, dtype=np.int)),
-                                      coding_identity)
-        coding_result, coding_ccode = coding_result[:-1].reshape((2, 3)), int(coding_result[-1])
+            coding_result, coding_cigar = self.get_and_prepare_cigar(t1pep, t2pep)
+            coding_common = self.cigar_length_in_common(coding_cigar)
+            coding_identical = sum(length for length, op in coding_cigar if op in ("M", "="))
+            if coding_identical == 0:
+                raise ValueError((coding_cigar, t1pep, t2pep))
+            coding_identity = round(100 * coding_identical / coding_common, 2)
+
+            coding_result = array_compare(np.ravel(np.array(c_t1_coding, dtype=np.int)),
+                                          np.ravel(np.array(c_t2_coding, dtype=np.int)),
+                                          coding_identity)
+            coding_result, coding_ccode = coding_result[:-1].reshape((2, 3)), int(coding_result[-1])
+
+        else:
+            c_t1_coding = "NA"
+            c_t2_coding = "NA"
+            coding_identity = 0
+            coding_result = np.zeros((2, 3))
+            coding_ccode = 0
 
         return (c_t1_exons, c_t2_exons, identity, result, ccode,
                 c_t1_coding, c_t2_coding, coding_identity, coding_result, coding_ccode)
@@ -369,15 +344,24 @@ class ComparisonWorker(mp.Process):
             c_t1_coding, c_t2_coding, coding_identity, coding_result, coding_ccode = self._analyse_cDNAs(cdnas, beds, peps)
         # Now let's get the results for the proteins
 
+        if ccode > 0:
+            ccode = chr(ccode)
+        else:
+            ccode = "NA"
+        if coding_ccode > 0:
+            coding_ccode = chr(coding_ccode)
+        else:
+            coding_ccode = "NA"
+
         deta = (t1, str(c_t1_exons), t2, str(c_t2_exons), identity,  # c_t1_exons, c_t2_exons,
                 *["{:0.2f}".format(100 * _) for _ in result[0]],
                 *["{:0.2f}".format(100 * _) for _ in result[1]],
-                chr(ccode),
+                ccode,
                 c_t1_coding, c_t2_coding,
                 coding_identity,
                 *["{:0.2f}".format(100 * _) for _ in coding_result[0]],
                 *["{:0.2f}".format(100 * _) for _ in coding_result[1]],
-                chr(coding_ccode))
+                coding_ccode)
         deta = (str(_) for _ in deta)
 
         return deta, result, identity, coding_result, coding_identity
@@ -534,6 +518,7 @@ def main():
     verbosity.add_argument("-v", "--verbose", default=False, action="store_true")
     parser.add_argument("--bed12", required=True,
                         help="BED12 file with the coordinates of the models to analyse.")
+
     parser.add_argument("-d", "--detailed", type=argparse.FileType("wt"), required=True)
     parser.add_argument("-t", "--threads", type=int, default=mp.cpu_count())
     parser.add_argument("-o", "--out", default=sys.stdout, type=argparse.FileType("wt"), required=True)
@@ -574,10 +559,13 @@ def main():
     log_handler.setFormatter(formatter)
     logger.addHandler(log_handler)
     logger.info("Starting to load BED file")
-    bed_db = tempfile.NamedTemporaryFile(delete=True, suffix="bed_database", prefix=".db", dir=os.getcwd())
-    # print(bed_db)
-    memoize_bed(args.bed12, bed_db.name)
-    logger.info("Loaded BED file")
+    # bed_db = tempfile.NamedTemporaryFile(delete=True, suffix="bed_database", prefix=".db", dir=os.getcwd())
+    bed_db = args.bed12 + ".bidx"
+    if not os.path.exists(bed_db) or os.stat(bed_db).st_ctime < os.stat(args.bed12).st_ctime:
+        # print(bed_db)
+        logger.info("Loading ")
+        memoize_bed(args.bed12, bed_db)
+        logger.info("Loaded BED file")
 
     writer = logging.handlers.QueueListener(logging_queue, logger)
     writer.respect_handler_level = True
@@ -585,7 +573,7 @@ def main():
 
     send_queue = mp.Queue(-1)
 
-    procs = [ComparisonWorker(bed_db.name, args.bed12, logging_queue, args.cdnas, send_queue, _, consider_reference=args.reference)
+    procs = [ComparisonWorker(bed_db, args.bed12, logging_queue, args.cdnas, send_queue, _, consider_reference=args.reference)
              for _ in range(args.threads)]
     [_.start() for _ in procs]
 
