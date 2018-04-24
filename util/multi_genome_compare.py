@@ -2,7 +2,7 @@
 
 import argparse
 import pyfaidx
-import parasail
+import eiliftover.util.transfer_utilities as transfer
 from Bio import Seq
 import itertools
 from Mikado.parsers.bed12 import Bed12Parser, BED12
@@ -96,19 +96,7 @@ def memoize_bed(string, sql):
 
 class ComparisonWorker(mp.Process):
 
-    op_consumes = {
-        "M": (True, True),
-        "=": (True, True),
-        "I": (True, False),
-        "D": (False, True),
-        "N": (False, True),
-        "S": (True, False),
-        "H": (False, False),
-        "P": (False, False),
-        "X": (True, True)
-    }
-
-    cigar_pattern = re.compile("({})".format("|".join(list(op_consumes.keys()))))
+    op_consumes = transfer.op_consumes.copy()
 
     def __init__(self, bed12records, bedfile, logging_queue, cdnas, entrance, identifier, consider_reference=False):
 
@@ -145,17 +133,7 @@ class ComparisonWorker(mp.Process):
         return cdna, bed, pep
 
     @classmethod
-    def get_and_prepare_cigar(cls, t1cdna, t2cdna):
-
-        # cigar_pattern = re.compile("(=|M|D|I|X|S|H)")
-        result = parasail.sg_trace_scan_32(t1cdna, t2cdna, 11, 1, parasail.blosum62)
-        # print(result.cigar.decode)
-        values = re.split(cls.cigar_pattern, result.cigar.decode.decode())
-        values = [(int(values[_ * 2]), values[_ * 2 + 1]) for _ in range(int((len(values) - 1) / 2))]
-        return result, values
-
-    @classmethod
-    def create_translation_array(cls, cigar, query_exons, target_exons):
+    def transfer_exon_coordinates(cls, cigar, query_exons, target_exons):
 
         """Inspired by https://github.com/MullinsLab/Bio-Cigar/blob/master/lib/Bio/Cigar.pm
         This function will translate the exons into a array-like space, allowing for
@@ -169,68 +147,20 @@ class ComparisonWorker(mp.Process):
         # Format: operation: [consumes_query, consumes_target]
         # First thing: determine the total length of the common space
 
-        common_length = cls.cigar_length_in_common(cigar)
-        # print(common_length)
-        query_array = [None] * common_length
-        target_array = [None] * common_length
-
-        # Now we have to translate the exons into this common space
-        # We will do this by creating "exons" derived from the alignment
-
-        common_pos = 0
-        query_pos = 0
-        target_pos = 0
-
-        for length, op in cigar:
-            consumes_query, consumes_target = cls.op_consumes[op]
-            if not any((consumes_query, consumes_target)):
-                continue
-            else:
-                for pos in range(common_pos, common_pos + length):
-                    if consumes_query:
-                        query_pos += 1
-                        query_array[pos] = query_pos
-                    if consumes_target:
-                        target_pos += 1
-                        target_array[pos] = target_pos
-                common_pos += length
-
-        for pos in range(1, query_exons[-1][1] + 1):
-            assert pos in query_array, (pos, min([_ for _ in query_array if _ is not None]), max([_ for _ in query_array if _ is not None]))
-        for pos in range(1, target_exons[-1][1] + 1):
-            assert pos in target_array
+        query_array, target_array = transfer.create_translation_array(cigar)
 
         try:
-            c_query_exons = cls.transfer_exons(query_exons, query_array)
+            c_query_exons = transfer.transfer_exons(query_exons, query_array)
         except ValueError as exc:
             raise ValueError("\n".join([str(_) for _ in
                                         [query_exons, query_array, cigar, exc]]))
         try:
-            c_target_exons = cls.transfer_exons(target_exons, target_array)
+            c_target_exons = transfer.transfer_exons(target_exons, target_array)
         except ValueError as exc:
             raise ValueError("\n".join([str(_) for _ in
                                         [target_exons, target_array, cigar, exc]]))
 
         return c_query_exons, c_target_exons, list(zip(query_array, target_array))
-
-    @classmethod
-    def cigar_length_in_common(cls, cigar):
-
-        return sum(length for length, op in cigar if any(cls.op_consumes[op]))
-
-    @staticmethod
-    def transfer_exons(exons, c_array):
-        """This static method will translate one set of exons into a different coordinate system
-        (given an array that translates each position in system 1 to a position in system 2)"""
-
-        c_exons = []
-        for exon in exons:
-            start, end = exon
-            c_start = c_array.index(start)
-            c_end = c_array.index(end)
-            c_exons.append((c_start, c_end))
-
-        return c_exons
 
     def run(self):
 
@@ -267,7 +197,7 @@ class ComparisonWorker(mp.Process):
 
     def _analyse_cDNAs(self, cdnas, beds, peps):
 
-        result, cigar = self.get_and_prepare_cigar(*cdnas)
+        result, cigar = transfer.get_and_prepare_cigar(*cdnas)
 
         t1bed, t2bed = beds
 
@@ -275,7 +205,7 @@ class ComparisonWorker(mp.Process):
         assert sorted(t2bed.blocks)[-1][1] == len(cdnas[1]), (t2bed.blocks, len(cdnas[1]))
 
         try:
-            c_t1_exons, c_t2_exons, common = self.create_translation_array(cigar, t1bed.blocks, t2bed.blocks)
+            c_t1_exons, c_t2_exons, common = self.transfer_exon_coordinates(cigar, t1bed.blocks, t2bed.blocks)
         except (ValueError, AssertionError) as exc:
             raise ValueError(exc)
 
@@ -301,8 +231,8 @@ class ComparisonWorker(mp.Process):
             assert t2_coding_exons
 
             query_array, target_array = list(zip(*common))
-            c_t1_coding = self.transfer_exons(t1_coding_exons, query_array)
-            c_t2_coding = self.transfer_exons(t2_coding_exons, target_array)
+            c_t1_coding = transfer.transfer_exons(t1_coding_exons, query_array)
+            c_t2_coding = transfer.transfer_exons(t2_coding_exons, target_array)
 
             t1pep, t2pep = peps
 
@@ -310,8 +240,8 @@ class ComparisonWorker(mp.Process):
                            t2bed.chrom, t2bed.thick_start - 2, t2bed.thick_end, t2pep)
             # print(t2bed.chrom, t2bed.thick_start-2, t2bed.thick_end, t2_coding_exons, t2pep)
 
-            coding_result, coding_cigar = self.get_and_prepare_cigar(t1pep, t2pep)
-            coding_common = self.cigar_length_in_common(coding_cigar)
+            coding_result, coding_cigar = transfer.get_and_prepare_cigar(t1pep, t2pep)
+            coding_common = transfer.cigar_length_in_common(coding_cigar)
             coding_identical = sum(length for length, op in coding_cigar if op in ("M", "="))
             if coding_identical == 0:
                 raise ValueError((coding_cigar, t1pep, t2pep))
