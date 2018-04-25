@@ -10,9 +10,61 @@ from Mikado.parsers.bed12 import BED12, Bed12Parser
 from Mikado.parsers.GFF import GFF3
 from Mikado.transcripts import Transcript
 from Bio import Seq
+import parasail
 
 
 __doc__ = """Script to try to translate the CDS from one coordinate system to another."""
+
+
+def transfer_by_alignment(ref_pep, target_cdna, target_bed):
+    frames = dict()
+    # Get the three-frame translation
+    for frame in range(3):
+        frames[frame] = str(Seq.Seq(str(target_cdna[frame:])).translate(to_stop=False))
+
+    # This will get the best match in the 3-frame translation
+    aln, best_frame, score, best_cigar = None, None, float("-inf"), None
+    for frame in frames:
+        res, cigar = transfer.get_and_prepare_cigar(ref_pep, frames[frame], open=3, extend=1, matrix=parasail.blosum85)
+        if res.score > score:
+            aln, best_frame, score, best_cigar = res, frame, res.score, cigar
+
+    # Now it is time to try to transfer it ... Ignore any deletions at the beginning
+    cig_start = 0
+    translation_start = 0
+
+    while not transfer.op_consumes[best_cigar[cig_start][1]][0]:
+        translation_start += best_cigar[cig_start][0]
+        cig_start += 1
+
+    # print(cig_start, best_cigar[cig_start:])
+    # This is 0-based; we have to add 1 because we start 1 base after the gap at the beginning
+    if translation_start > 0:
+        translation_start = 3 * translation_start + 1
+
+    translated = str(Seq.Seq(str(target_cdna[translation_start:])).translate(to_stop=True))
+    # Logic to handle when the CDS is broken
+    # This is 1-based, so we have to add 1 to
+    target_bed.thick_start = translation_start + 1
+    end = target_bed.thick_start + len(translated) * 3 - 1
+
+    if translated and translated[0] != ref_pep[0]:
+        if translation_start in (0, 1, 2):
+            target_bed.phase = translation_start
+        else:
+            target_bed.coding = False
+            return target_bed
+
+    # Now check whether we can add the stop codon
+    if end + 3 < len(target_cdna):
+        end += 3
+    else:  # Here we have to presume that it is open.
+        end = len(target_cdna)
+
+    # print(translation_start * 3, translated)
+    target_bed.thick_end = end
+    target_bed.coding = True
+    return target_bed
 
 
 def transfer_cds(transcript, ref_cdna, ref_bed, target_cdna, target_bed, logger=None, out=sys.stdout):
@@ -27,7 +79,7 @@ def transfer_cds(transcript, ref_cdna, ref_bed, target_cdna, target_bed, logger=
     result, cigar = transfer.get_and_prepare_cigar(str(ref_cdna), str(target_cdna))
     ref_array, target_array = transfer.create_translation_array(cigar)
 
-    # ref_pep = ref_cdna[ref_bed.thick_start - 1:ref_bed.thick_end]
+    ref_pep = str(Seq.Seq(str(ref_cdna[ref_bed.thick_start - 1:ref_bed.thick_end])).translate())
 
     # target_start, target_end = None, None
 
@@ -48,8 +100,9 @@ def transfer_cds(transcript, ref_cdna, ref_bed, target_cdna, target_bed, logger=
         if target_start == target_bed.thick_start and target_end == target_bed.thick_end:
             replace = False  # Everything fine here
         else:
-            target_pep = Seq.Seq(str(target_cdna[target_start - 1:target_end])).translate()
-            if str(target_pep).startswith("M") and str(target_pep).endswith("*") and str(target_pep).count("*") == 1:
+            target_pep = str(Seq.Seq(str(target_cdna[target_start - 1:target_end])).translate())
+            if (target_pep[0] == ref_pep[0] and target_pep[-1] == ref_pep[-1] and
+                    ((ref_pep[-1] == "*" and target_pep.count("*") == 1) or target_pep.count("*") == 0)):
                 target_bed.thick_start, target_bed.thick_end = target_start, target_end
             else:
                 target_bed.coding = False
@@ -57,10 +110,14 @@ def transfer_cds(transcript, ref_cdna, ref_bed, target_cdna, target_bed, logger=
         target_bed.coding = False
 
     if not replace:
+        transcript.attributes["original_cds"] = True
+        transcript.attributes["aligner_cds"] = True
         print("CDS transferred correctly for {}".format(ref_bed.chrom))
     else:
         transcript.strip_cds()
-        valid = True
+        transcript.attributes["original_cds"] = True
+        transcript.attributes["aligner_cds"] = False
+        target_bed.transcriptomic = True
         if target_bed.coding is True:
             try:
                 valid = (not target_bed.invalid)
@@ -69,12 +126,37 @@ def transfer_cds(transcript, ref_cdna, ref_bed, target_cdna, target_bed, logger=
         else:
             valid = False
         if valid:
-            print("New CDS for {}: from {}-{} to {}-{}".format(ref_bed.chrom,
+            print("Transferred original CDS for {}: from {}-{} to {}-{}".format(ref_bed.chrom,
                                                                orig_start, orig_end,
                                                                target_bed.thick_start, target_bed.thick_end))
+
             transcript.load_orfs([target_bed])
+
         else:
-            print("Stripped CDS from {}".format(ref_bed.chrom))
+            # Here we try to transfer the CDS through alignment
+            transcript.attributes["original_cds"] = False
+            transcript.attributes["original_cds_coords"] = "{}-{}".format(target_start, target_end)
+            recalc_coords = (target_bed.thick_start, target_bed.thick_end)
+            target_bed = transfer_by_alignment(ref_pep, target_cdna, target_bed)
+            target_bed.transcriptomic = True
+            # Let's see what happens when we just use the transferred cDNA start
+
+            if target_bed.coding is True and target_bed.invalid is False:
+                if (orig_start, orig_end) == (target_bed.thick_start, target_bed.thick_end):
+                    print("GMAP corrected the CDS for {}: from {}-{} to {}-{}".format(
+                        ref_bed.chrom,
+                        recalc_coords[0], recalc_coords[1],
+                        target_bed.thick_start, target_bed.thick_end
+                    ))
+                    transcript.attributes["aligner_cds"] = True
+                else:
+                    print("New CDS for {}: from {}-{} to {}-{}".format(ref_bed.chrom,
+                                                                       orig_start, orig_end,
+                                                                       target_bed.thick_start, target_bed.thick_end))
+                transcript.load_orfs([target_bed])
+            else:
+                print("Stripping CDS from {}".format(ref_bed.chrom))
+                # transcript.load_orfs([target_bed])
 
     print(transcript.format("gff3"), file=out)
 
