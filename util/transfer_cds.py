@@ -11,6 +11,7 @@ from Mikado.parsers.GFF import GFF3
 from Mikado.transcripts import Transcript
 from Bio import Seq
 import parasail
+import multiprocessing as mp
 
 
 __doc__ = """Script to try to translate the CDS from one coordinate system to another."""
@@ -25,7 +26,11 @@ def transfer_by_alignment(ref_pep, target_cdna, target_bed):
     # This will get the best match in the 3-frame translation
     aln, best_frame, score, best_cigar = None, None, float("-inf"), None
     for frame in frames:
-        res, cigar = transfer.get_and_prepare_cigar(ref_pep, frames[frame], open=3, extend=1, matrix=parasail.blosum85)
+        res, cigar = transfer.get_and_prepare_cigar(ref_pep,
+                                                    frames[frame],
+                                                    open=3,
+                                                    extend=1,
+                                                    matrix=parasail.blosum85)
         if res.score > score:
             aln, best_frame, score, best_cigar = res, frame, res.score, cigar
 
@@ -33,16 +38,30 @@ def transfer_by_alignment(ref_pep, target_cdna, target_bed):
     cig_start = 0
     translation_start = 0
 
-    while not transfer.op_consumes[best_cigar[cig_start][1]][0]:
-        translation_start += best_cigar[cig_start][0]
-        cig_start += 1
+    for cig_pos, cig in enumerate(best_cigar):
+        le, op = cig
+        if not transfer.op_consumes[op][0]:
+            # Pass by deletions
+            cig_start += 1
+            translation_start += best_cigar[cig_start][0]
+            continue
+        else:
+            if transfer.op_consumes[op][1]:
+                # anslation_start += best_cigar[cig_start][0]
+                break
+            else:
+                cig_start += 1
+                continue
 
-    # print(cig_start, best_cigar[cig_start:])
     # This is 0-based; we have to add 1 because we start 1 base after the gap at the beginning
     if translation_start > 0:
         translation_start = 3 * translation_start + 1
+    else:
+        # We have to account for the frame!
+        translation_start = best_frame
 
     translated = str(Seq.Seq(str(target_cdna[translation_start:])).translate(to_stop=True))
+
     # Logic to handle when the CDS is broken
     # This is 1-based, so we have to add 1 to
     target_bed.thick_start = translation_start + 1
@@ -51,9 +70,27 @@ def transfer_by_alignment(ref_pep, target_cdna, target_bed):
     if translated and translated[0] != ref_pep[0]:
         if translation_start in (0, 1, 2):
             target_bed.phase = translation_start
+            target_bed.thick_start = 1
         else:
             target_bed.coding = False
-            return target_bed
+            return target_bed, ()
+    elif not translated:
+        target_bed.coding = False
+        return target_bed, ()
+
+    # Get the coordinates on the original protein
+
+    pep_res, pep_cigar = transfer.get_and_prepare_cigar(ref_pep, translated,
+                                                        open=3, extend=1, matrix=parasail.blosum85)
+
+    pep_ref_array, pep_target_array = transfer.create_translation_array(pep_cigar)
+    pep_start, pep_end = None, None
+
+    for pos in range(1, len(pep_ref_array) + 1):
+        if pep_ref_array[pos - 1] and pep_target_array[pos - 1]:
+            if not pep_start:
+                pep_start = pos
+        pep_end = pos
 
     # Now check whether we can add the stop codon
     if end + 3 < len(target_cdna):
@@ -64,15 +101,17 @@ def transfer_by_alignment(ref_pep, target_cdna, target_bed):
     # print(translation_start * 3, translated)
     target_bed.thick_end = end
     target_bed.coding = True
-    return target_bed
+    target_bed.transcriptomic = True
+    return target_bed, (pep_start, pep_end)
 
 
-def transfer_cds(transcript, ref_cdna, ref_bed, target_cdna, target_bed, logger=None, out=sys.stdout):
+def transfer_cds(transcript, ref_cdna, ref_bed, target_cdna, target_bed):
 
     if transcript is None:
         return
 
     transcript.finalize()
+    assert target_bed.transcriptomic is True
 
     orig_start, orig_end = target_bed.thick_start, target_bed.thick_end
 
@@ -109,6 +148,8 @@ def transfer_cds(transcript, ref_cdna, ref_bed, target_cdna, target_bed, logger=
     else:
         target_bed.coding = False
 
+    # We presume it is correct
+    pep_coords = (1, len(ref_pep))
     if not replace:
         transcript.attributes["original_cds"] = True
         transcript.attributes["aligner_cds"] = True
@@ -117,7 +158,6 @@ def transfer_cds(transcript, ref_cdna, ref_bed, target_cdna, target_bed, logger=
         transcript.strip_cds()
         transcript.attributes["original_cds"] = True
         transcript.attributes["aligner_cds"] = False
-        target_bed.transcriptomic = True
         if target_bed.coding is True:
             try:
                 valid = (not target_bed.invalid)
@@ -137,13 +177,14 @@ def transfer_cds(transcript, ref_cdna, ref_bed, target_cdna, target_bed, logger=
             transcript.attributes["original_cds"] = False
             transcript.attributes["original_cds_coords"] = "{}-{}".format(target_start, target_end)
             recalc_coords = (target_bed.thick_start, target_bed.thick_end)
-            target_bed = transfer_by_alignment(ref_pep, target_cdna, target_bed)
-            target_bed.transcriptomic = True
+            target_bed, pep_coords = transfer_by_alignment(ref_pep, target_cdna, target_bed)
             # Let's see what happens when we just use the transferred cDNA start
 
             if target_bed.coding is True and target_bed.invalid is False:
+                transcript.attributes["original_pep_coords"] = "{}-{}".format(*pep_coords)
+                transcript.attributes["original_pep_complete"] = (pep_coords[0] == 1 and pep_coords[1] == len(ref_pep))
                 if (orig_start, orig_end) == (target_bed.thick_start, target_bed.thick_end):
-                    print("GMAP corrected the CDS for {}: from {}-{} to {}-{}".format(
+                    print("GMAP corrected the CDS and phase for {}: from {}-{} to {}-{}".format(
                         ref_bed.chrom,
                         recalc_coords[0], recalc_coords[1],
                         target_bed.thick_start, target_bed.thick_end
@@ -154,11 +195,11 @@ def transfer_cds(transcript, ref_cdna, ref_bed, target_cdna, target_bed, logger=
                                                                        orig_start, orig_end,
                                                                        target_bed.thick_start, target_bed.thick_end))
                 transcript.load_orfs([target_bed])
-            else:
-                print("Stripping CDS from {}".format(ref_bed.chrom))
-                # transcript.load_orfs([target_bed])
 
-    print(transcript.format("gff3"), file=out)
+    if pep_coords:
+        pep_coords = (pep_coords[0], pep_coords[1], (pep_coords[0] == 1 and pep_coords[1] == len(ref_pep)))
+
+    return transcript, target_bed, pep_coords
 
 
 def main():
@@ -168,6 +209,10 @@ def main():
     parser.add_argument("--cdnas", nargs=2, required=True)
     parser.add_argument("-gf", help="GFF3 of the transferred annotation.", required=True)
     parser.add_argument("--out", default=sys.stdout, type=argparse.FileType("wt"))
+    parser.add_argument("-ob", "--out-bed", dest="out_bed", required=False,
+                        default=None,
+                        type=argparse.FileType("wt"))
+    parser.add_argument("-p", "--processes", type=int, default=mp.cpu_count())
     args = parser.parse_args()
 
     cdnas = dict()
@@ -178,13 +223,16 @@ def main():
     for key, cdna, bed in zip(("ref", "target"), args.cdnas, args.bed12):
         cdnas[key] = pyfaidx.Fasta(cdna)
         beds[key] = dict()
-        for entry in Bed12Parser(bed):
+        for entry in Bed12Parser(bed, transcriptomic=True):
             if entry.header:
                 continue
             beds[key][re.sub(gmap_pat, "", entry.chrom)] = entry
 
     # Now let us start parsing the GFF3, which we presume being a GMAP GFF3
     transcript = None
+
+    results = []
+    pool = mp.Pool(processes=args.processes)
 
     for line in GFF3(args.gf):
         if line.header is True or line.gene is True:
@@ -193,20 +241,31 @@ def main():
         elif line.is_transcript is True:
             if transcript:
                 tid = re.sub(gmap_pat, "", transcript.id)
-                transfer_cds(transcript,
-                             cdnas["ref"][tid], beds["ref"][tid],
-                             cdnas["target"][transcript.id], beds["target"][tid],
-                             out=args.out)
+                results.append(pool.apply_async(transfer_cds, ((transcript,
+                             str(cdnas["ref"][tid]), beds["ref"][tid],
+                             str(cdnas["target"][transcript.id]), beds["target"][tid],
+                             ))))
+
             transcript = Transcript(line)
         elif line.is_exon is True:
             transcript.add_exon(line)
 
     if transcript:
         tid = re.sub(gmap_pat, "", transcript.id)
-        transfer_cds(transcript,
-                     cdnas["ref"][tid], beds["ref"][tid],
-                     cdnas["target"][transcript.id], beds["target"][tid],
-                     out=args.out)
+        results.append(pool.apply_async(transfer_cds, ((transcript,
+                                                        str(cdnas["ref"][tid]), beds["ref"][tid],
+                                                        str(cdnas["target"][transcript.id]), beds["target"][tid],
+                                                        ))))
+
+    for res in results:
+        transcript, target_bed, pep_coords = res.get()
+        if args.out_bed is not None:
+            target_bed.name = "ID={};coding={}".format(target_bed.name, target_bed.coding)
+            if target_bed.coding:
+                target_bed.name = target_bed.name + ";phase={};original_pep_coords={}-{};original_pep_complete={}".format(
+                    target_bed.phase, *pep_coords)
+            print(target_bed, file=args.out_bed)
+        print(transcript, file=args.out)
 
     return
 
