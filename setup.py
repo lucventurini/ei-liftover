@@ -14,6 +14,7 @@ setup(
                              Extension(path.join("eiliftover.alignments.cminimap"),
                                        [path.join("eiliftover", "alignments", "cminimap.pyx")]),
                              ]),
+    packages= find_packages() + glob("eiliftover/"),
     include_dirs=[numpy.get_include()],
     scripts=glob("util/*.py")
 )
