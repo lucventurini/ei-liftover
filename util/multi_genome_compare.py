@@ -214,7 +214,7 @@ class ComparisonWorker(mp.Process):
         result, ccode = result[:-1].reshape((2, 3)), int(result[-1])
         # Now that we have analysed the cDNAs, it is time for the CDS
 
-        if t1bed.coding and t2bed.coding:
+        if t1bed.coding and t2bed.coding and all(peps):
 
             t1_coding_exons = [(max(t1bed.thick_start - 1, _[0]), min(t1bed.thick_end, _[1])) for _ in t1bed.blocks
                                if overlap(_, (t1bed.thick_start - 1, t1bed.thick_end)) > 0]
