@@ -238,13 +238,21 @@ class ComparisonWorker(mp.Process):
             coding_common = transfer.cigar_length_in_common(coding_cigar)
             coding_identical = sum(length for length, op in coding_cigar if op in ("M", "="))
             if coding_identical == 0:
-                raise ValueError((t1bed.name, coding_cigar, t1pep, t2pep))
-            coding_identity = round(100 * coding_identical / coding_common, 2)
+                self.log.warning("No protein overlap at all for %s and %s",
+                                 t1bed.name, t2bed.name)
+                c_t1_coding = "NA"
+                c_t2_coding = "NA"
+                coding_identity = 0
+                coding_result = np.zeros((2, 3))
+                coding_ccode = 0
+                # raise ValueError((t1bed.name, coding_cigar, t1pep, t2pep))
+            else:
+                coding_identity = round(100 * coding_identical / coding_common, 2)
 
-            coding_result = array_compare(np.ravel(np.array(c_t1_coding, dtype=np.int)),
-                                          np.ravel(np.array(c_t2_coding, dtype=np.int)),
-                                          coding_identity)
-            coding_result, coding_ccode = coding_result[:-1].reshape((2, 3)), int(coding_result[-1])
+                coding_result = array_compare(np.ravel(np.array(c_t1_coding, dtype=np.int)),
+                                              np.ravel(np.array(c_t2_coding, dtype=np.int)),
+                                              coding_identity)
+                coding_result, coding_ccode = coding_result[:-1].reshape((2, 3)), int(coding_result[-1])
 
         else:
             c_t1_coding = "NA"
