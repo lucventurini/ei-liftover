@@ -38,7 +38,6 @@ class _Storer(transfer_base):
         self.id, self.bed, self.gff3 = id, bed, gff3
 
 
-
 class Transferer(mp.Process):
 
     def __init__(self, out_sq, queue):

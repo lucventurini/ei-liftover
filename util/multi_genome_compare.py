@@ -47,12 +47,6 @@ def memoize_bed(string, sql):
 
     """Function to memoize a BED12 file for fast access"""
 
-    db = sqlite3.connect(sql)
-    db.execute("CREATE TABLE IF NOT EXISTS bed (chrom TEXT, start INT, \
-    end INT, name TEXT, score REAL, strand CHAR, thick_start INT, \
-    thick_end INT, rgb TEXT, count INT, sizes TEXT, starts TEXT)")
-    db.execute("CREATE INDEX IF NOT EXISTS bedidx ON bed(name)")
-
     # records = dict()
     beds = []
 
@@ -129,7 +123,7 @@ class ComparisonWorker(mp.Process):
         bed = BED12(self.bedfile.readline())
         assert bed.name == transcript, (bed.name, transcript, bed_position)
         bed = bed.to_transcriptomic(sequence=cdna)
-        pep = str(Seq.Seq(str(cdna[max(0, bed.thick_start - 1):bed.thick_end])).translate())
+        pep = str(Seq.Seq(str(cdna[max(0 + bed.phase, bed.thick_start - 1):bed.thick_end])).translate())
         return cdna, bed, pep
 
     @classmethod
@@ -244,7 +238,7 @@ class ComparisonWorker(mp.Process):
             coding_common = transfer.cigar_length_in_common(coding_cigar)
             coding_identical = sum(length for length, op in coding_cigar if op in ("M", "="))
             if coding_identical == 0:
-                raise ValueError((coding_cigar, t1pep, t2pep))
+                raise ValueError((t1bed.name, coding_cigar, t1pep, t2pep))
             coding_identity = round(100 * coding_identical / coding_common, 2)
 
             coding_result = array_compare(np.ravel(np.array(c_t1_coding, dtype=np.int)),
@@ -271,7 +265,9 @@ class ComparisonWorker(mp.Process):
         # beds = [beds[0].to_transcriptomic(sequence=cdnas[0]), beds[1].to_transcriptomic(sequence=cdnas[1])]
 
         c_t1_exons, c_t2_exons, identity, result, ccode, \
-            c_t1_coding, c_t2_coding, coding_identity, coding_result, coding_ccode = self._analyse_cDNAs(cdnas, beds, peps)
+            c_t1_coding, c_t2_coding, coding_identity, coding_result, coding_ccode = self._analyse_cDNAs(cdnas,
+                                                                                                         beds,
+                                                                                                         peps)
         # Now let's get the results for the proteins
 
         if ccode > 0:
@@ -488,12 +484,12 @@ def main():
     logger.setLevel(level)
     log_handler.setFormatter(formatter)
     logger.addHandler(log_handler)
-    logger.info("Starting to load BED file")
+
     # bed_db = tempfile.NamedTemporaryFile(delete=True, suffix="bed_database", prefix=".db", dir=os.getcwd())
     bed_db = args.bed12 + ".bidx"
     if not os.path.exists(bed_db) or os.stat(bed_db).st_ctime < os.stat(args.bed12).st_ctime:
         # print(bed_db)
-        logger.info("Loading ")
+        logger.info("Starting to load BED file")
         memoize_bed(args.bed12, bed_db)
         logger.info("Loaded BED file")
 
