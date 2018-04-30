@@ -12,9 +12,68 @@ from Mikado.transcripts import Transcript
 from Bio import Seq
 import parasail
 import multiprocessing as mp
+import sqlalchemy
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy import Integer, Column, BLOB
+from sqlalchemy.orm import sessionmaker
+import tempfile
+import os
 
 
 __doc__ = """Script to try to translate the CDS from one coordinate system to another."""
+
+transfer_base = declarative_base()
+
+
+class _Storer(transfer_base):
+
+    __tablename__ = "storer"
+
+    id = Column(Integer, primary_key=True)
+    bed = Column(BLOB)
+    gff3 = Column(BLOB)
+
+    def __init__(self, id, bed, gff3):
+
+        self.id, self.bed, self.gff3 = id, bed, gff3
+
+
+
+class Transferer(mp.Process):
+
+    def __init__(self, out_sq, queue):
+
+        super().__init__()
+        self.out_sq = out_sq
+        self.engine = sqlalchemy.create_engine("sqlite:///{}".format(out_sq))
+        transfer_base.metadata.create_all(self.engine)
+        self.Session = sessionmaker(bind=self.engine)
+        self.session = self.Session()
+        self.queue = queue
+
+    def run(self):
+
+        while True:
+            obj_input = self.queue.get()
+            if obj_input == "EXIT":
+                self.queue.put("EXIT")
+                self.session.commit()
+                # self.join()
+                return
+            num_id, (transcript,
+             ref_cdna, ref_bed,
+             target_cdna, target_bed) = obj_input
+
+            transcript, target_bed, pep_coords = transfer_cds(transcript, ref_cdna, ref_bed, target_cdna, target_bed)
+            target_bed.name = "ID={};coding={}".format(target_bed.name, target_bed.coding)
+            if target_bed.coding:
+                target_bed.name = target_bed.name + ";phase={};original_pep_coords={}-{};original_pep_complete={}".format(
+                    target_bed.phase, *pep_coords)
+            else:
+                target_bed.thick_start, target_bed.thick_end = 1, target_bed.end
+
+            self.session.add(_Storer(num_id, str(target_bed).encode(), transcript.format("gff3").encode()))
+            self.session.commit()
 
 
 def transfer_by_alignment(ref_pep, target_cdna, target_bed):
@@ -231,9 +290,19 @@ def main():
     # Now let us start parsing the GFF3, which we presume being a GMAP GFF3
     transcript = None
 
-    results = []
-    pool = mp.Pool(processes=args.processes)
+    procs = []
+    queue = mp.Queue(-1)
+    for proc in range(args.processes):
+        sq = tempfile.NamedTemporaryFile(mode="wb")
+        sq.close()
+        sq = sq.name
+        _proc = Transferer(sq, queue)
+        _proc.start()
+        procs.append(_proc)
 
+    # pool = mp.Pool(processes=args.processes)
+
+    tnum = -1
     for line in GFF3(args.gf):
         if line.header is True or line.gene is True:
             print(line, file=args.out)
@@ -241,31 +310,47 @@ def main():
         elif line.is_transcript is True:
             if transcript:
                 tid = re.sub(gmap_pat, "", transcript.id)
-                results.append(pool.apply_async(transfer_cds, ((transcript,
-                             str(cdnas["ref"][tid]), beds["ref"][tid],
-                             str(cdnas["target"][transcript.id]), beds["target"][tid],
-                             ))))
-
+                ref_cdna = str(cdnas["ref"][tid])
+                ref_bed = beds["ref"][tid]
+                target_cdna = str(cdnas["target"][transcript.id])
+                target_bed =  beds["target"][tid]
+                tnum += 1
+                queue.put((tnum,
+                           (transcript,
+                            ref_cdna, ref_bed,
+                            target_cdna, target_bed)
+                           ))
             transcript = Transcript(line)
         elif line.is_exon is True:
             transcript.add_exon(line)
 
     if transcript:
+        tnum += 1
         tid = re.sub(gmap_pat, "", transcript.id)
-        results.append(pool.apply_async(transfer_cds, ((transcript,
-                                                        str(cdnas["ref"][tid]), beds["ref"][tid],
-                                                        str(cdnas["target"][transcript.id]), beds["target"][tid],
-                                                        ))))
+        ref_cdna = str(cdnas["ref"][tid])
+        ref_bed = beds["ref"][tid]
+        target_cdna = str(cdnas["target"][transcript.id])
+        target_bed = beds["target"][tid]
+        queue.put((tnum,
+                   (transcript,
+                    ref_cdna, ref_bed,
+                    target_cdna, target_bed)
+                   ))
 
-    for res in results:
-        transcript, target_bed, pep_coords = res.get()
-        if args.out_bed is not None:
-            target_bed.name = "ID={};coding={}".format(target_bed.name, target_bed.coding)
-            if target_bed.coding:
-                target_bed.name = target_bed.name + ";phase={};original_pep_coords={}-{};original_pep_complete={}".format(
-                    target_bed.phase, *pep_coords)
-            print(target_bed, file=args.out_bed)
-        print(transcript, file=args.out)
+    queue.put("EXIT")
+    [_proc.join() for _proc in procs]
+
+    # Now the printing ...
+    # results = dict()
+
+    for proc in procs:
+        sq = sqlalchemy.create_engine("sqlite:///{}".format(proc.out_sq))
+        for res in sq.execute("select * from storer"):
+            num, bed12, gff3 = res
+            if args.out_bed is not None:
+                print(bed12.decode(), file=args.out_bed)
+            print(*gff3.decode().split("\n"), file=args.out, sep="\n")
+        os.remove(proc.out_sq)
 
     return
 
