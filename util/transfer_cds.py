@@ -171,6 +171,7 @@ def transfer_cds(transcript, ref_cdna, ref_bed, target_cdna, target_bed):
 
     transcript.finalize()
     assert target_bed.transcriptomic is True
+    was_coding = target_bed.coding
 
     orig_start, orig_end = target_bed.thick_start, target_bed.thick_end
 
@@ -244,7 +245,7 @@ def transfer_cds(transcript, ref_cdna, ref_bed, target_cdna, target_bed):
             if target_bed.coding is True and target_bed.invalid is False:
                 transcript.attributes["original_pep_coords"] = "{}-{}".format(*pep_coords)
                 transcript.attributes["original_pep_complete"] = (pep_coords[0] == 1 and pep_coords[1] == len(ref_pep))
-                if (orig_start, orig_end) == (target_bed.thick_start, target_bed.thick_end):
+                if (orig_start, orig_end) == (target_bed.thick_start, target_bed.thick_end) and was_coding:
                     print("GMAP corrected the CDS and phase for {}: from {}-{} to {}-{}".format(
                         ref_bed.chrom,
                         recalc_coords[0], recalc_coords[1],
@@ -256,6 +257,8 @@ def transfer_cds(transcript, ref_cdna, ref_bed, target_cdna, target_bed):
                                                                        orig_start, orig_end,
                                                                        target_bed.thick_start, target_bed.thick_end))
                 transcript.load_orfs([target_bed])
+            else:
+                print("No CDS transferred for {} onto its mapping {}".format(ref_bed.chrom, target_bed.chrom))
 
     if pep_coords:
         pep_coords = (pep_coords[0], pep_coords[1], (pep_coords[0] == 1 and pep_coords[1] == len(ref_pep)))
