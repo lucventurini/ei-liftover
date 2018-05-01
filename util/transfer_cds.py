@@ -194,18 +194,19 @@ def transfer_cds(transcript, ref_cdna, ref_bed, target_cdna, target_bed):
 
     replace = True
 
-    if target_start is not None and target_end is not None:
-        if target_start == target_bed.thick_start and target_end == target_bed.thick_end:
-            replace = False  # Everything fine here
-        else:
-            target_pep = str(Seq.Seq(str(target_cdna[target_start - 1:target_end])).translate())
-            if (target_pep[0] == ref_pep[0] and target_pep[-1] == ref_pep[-1] and
-                    ((ref_pep[-1] == "*" and target_pep.count("*") == 1) or target_pep.count("*") == 0)):
-                target_bed.thick_start, target_bed.thick_end = target_start, target_end
+    if target_bed.coding is True:
+        if target_start is not None and target_end is not None:
+            if target_start == target_bed.thick_start and target_end == target_bed.thick_end:
+                replace = False  # Everything fine here
             else:
-                target_bed.coding = False
-    else:
-        target_bed.coding = False
+                target_pep = str(Seq.Seq(str(target_cdna[target_start - 1:target_end])).translate())
+                if (target_pep[0] == ref_pep[0] and target_pep[-1] == ref_pep[-1] and
+                        ((ref_pep[-1] == "*" and target_pep.count("*") == 1) or target_pep.count("*") == 0)):
+                    target_bed.thick_start, target_bed.thick_end = target_start, target_end
+                else:
+                    target_bed.coding = False
+        else:
+            target_bed.coding = False
 
     # We presume it is correct
     pep_coords = (1, len(ref_pep))
@@ -213,6 +214,7 @@ def transfer_cds(transcript, ref_cdna, ref_bed, target_cdna, target_bed):
         transcript.attributes["original_cds"] = True
         transcript.attributes["aligner_cds"] = True
         print("CDS transferred correctly for {}".format(ref_bed.chrom))
+
     else:
         transcript.strip_cds()
         transcript.attributes["original_cds"] = True
