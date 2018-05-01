@@ -18,6 +18,7 @@ from sqlalchemy import Integer, Column, BLOB
 from sqlalchemy.orm import sessionmaker
 import tempfile
 import os
+from collections import defaultdict
 
 
 __doc__ = """Script to try to translate the CDS from one coordinate system to another."""
@@ -265,7 +266,7 @@ def main():
     parser = argparse.ArgumentParser(__doc__)
     parser.add_argument("--bed12", nargs=2, required=True, help="Transcriptomic cDNAs BED12s")
     parser.add_argument("--cdnas", nargs=2, required=True)
-    parser.add_argument("-gf", help="GFF3 of the transferred annotation.", required=True)
+    parser.add_argument("-gf", help="GFF3/BED12 of the transferred annotation.", required=True)
     parser.add_argument("--out", default=sys.stdout, type=argparse.FileType("wt"))
     parser.add_argument("-ob", "--out-bed", dest="out_bed", required=False,
                         default=None,
@@ -275,16 +276,30 @@ def main():
 
     cdnas = dict()
     beds = dict()
+    beds["ref"] = dict()
+    beds["target"] = dict()
 
     gmap_pat = re.compile("\.mrna[0-9]*$")
 
-    for key, cdna, bed in zip(("ref", "target"), args.cdnas, args.bed12):
-        cdnas[key] = pyfaidx.Fasta(cdna)
-        beds[key] = dict()
-        for entry in Bed12Parser(bed, transcriptomic=True):
-            if entry.header:
-                continue
-            beds[key][re.sub(gmap_pat, "", entry.chrom)] = entry
+    cdnas["ref"] = pyfaidx.Fasta(args.cdnas[0])
+    cdnas["target"] = pyfaidx.Fasta(args.cdnas[1])
+    for entry in Bed12Parser(args.bed12[0], transcriptomic=True):
+        if entry.header:
+            continue
+        name = entry.chrom
+        if name in beds["ref"]:
+            raise KeyError("Duplicated ID for the reference: {}".format(name))
+        if name not in cdnas["ref"]:
+            raise KeyError("Reference {} not found in the cDNAs!".format(name))
+        beds["ref"][name] = entry
+
+    beds["target"] = defaultdict(dict)
+    for entry in Bed12Parser(args.bed12[1], transcriptomic=True):
+        # Now, here we have to account for the fact that there *might* be multiple alignments
+        name = re.sub(gmap_pat, "", entry.chrom)
+        if entry.chrom not in cdnas["target"]:
+            raise KeyError("Target {} not found in the cDNAs!".format(entry.chrom))
+        beds["target"][name][entry.chrom] = entry
 
     # Now let us start parsing the GFF3, which we presume being a GMAP GFF3
     transcript = None
@@ -302,39 +317,60 @@ def main():
     # pool = mp.Pool(processes=args.processes)
 
     tnum = -1
-    for line in GFF3(args.gf):
-        if line.header is True or line.gene is True:
-            print(line, file=args.out)
-            continue
-        elif line.is_transcript is True:
-            if transcript:
+    if args.gf.endswith("bed12"):
+        parser = Bed12Parser(args.gf, transcriptomic=False)
+        for line in parser:
+            if line.header:
+                continue
+            else:
+                transcript = Transcript(line)
                 tid = re.sub(gmap_pat, "", transcript.id)
                 ref_cdna = str(cdnas["ref"][tid])
                 ref_bed = beds["ref"][tid]
                 target_cdna = str(cdnas["target"][transcript.id])
-                target_bed =  beds["target"][tid]
+                target_bed = beds["target"][tid][transcript.id]
                 tnum += 1
                 queue.put((tnum,
                            (transcript,
                             ref_cdna, ref_bed,
                             target_cdna, target_bed)
                            ))
-            transcript = Transcript(line)
-        elif line.is_exon is True:
-            transcript.add_exon(line)
+    else:
+        parser = GFF3(args.gf)
 
-    if transcript:
-        tnum += 1
-        tid = re.sub(gmap_pat, "", transcript.id)
-        ref_cdna = str(cdnas["ref"][tid])
-        ref_bed = beds["ref"][tid]
-        target_cdna = str(cdnas["target"][transcript.id])
-        target_bed = beds["target"][tid]
-        queue.put((tnum,
-                   (transcript,
-                    ref_cdna, ref_bed,
-                    target_cdna, target_bed)
-                   ))
+        for line in parser:
+            if line.header is True or not isinstance(line, BED12) and line.gene is True:
+                print(line, file=args.out)
+                continue
+            elif line.is_transcript is True:
+                if transcript:
+                    tid = re.sub(gmap_pat, "", transcript.id)
+                    ref_cdna = str(cdnas["ref"][tid])
+                    ref_bed = beds["ref"][tid]
+                    target_cdna = str(cdnas["target"][transcript.id])
+                    target_bed = beds["target"][tid][transcript.id]
+                    tnum += 1
+                    queue.put((tnum,
+                               (transcript,
+                                ref_cdna, ref_bed,
+                                target_cdna, target_bed)
+                               ))
+                transcript = Transcript(line)
+            elif line.is_exon is True:
+                transcript.add_exon(line)
+
+        if transcript:
+            tnum += 1
+            tid = re.sub(gmap_pat, "", transcript.id)
+            ref_cdna = str(cdnas["ref"][tid])
+            ref_bed = beds["ref"][tid]
+            target_cdna = str(cdnas["target"][transcript.id])
+            target_bed = beds["target"][tid][transcript.id]
+            queue.put((tnum,
+                       (transcript,
+                        ref_cdna, ref_bed,
+                        target_cdna, target_bed)
+                       ))
 
     queue.put("EXIT")
     [_proc.join() for _proc in procs]
