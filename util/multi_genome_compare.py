@@ -23,6 +23,7 @@ from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.engine import create_engine
 from sqlalchemy import Column, Integer, Float, Text, CHAR, Index
 from sqlalchemy.orm.session import Session
+import numpy as np
 
 
 DBBASE = declarative_base()
@@ -399,7 +400,7 @@ class OutPrinter(mp.Process):
         return
 
     def print_detailed(self):
-        dbs = [sqlite3.connect(_.name) for _ in self.dbnames]
+
         # rows = []
         header = "Group T1 T1_exons".split()
         header += "T2 T2_exons".split()
@@ -413,18 +414,21 @@ class OutPrinter(mp.Process):
         header += ["{}(CDS,Junction)".format(_) for _ in ["Recall", "Precision", "F1"]]
         header += ["CCode(CDS)"]
 
+        dbs = [sqlite3.connect(_.name) for _ in self.dbnames]
+        results = defaultdict(list)
+        for db in dbs:
+            for gid, row in db.execute("SELECT gid, row FROM details"):
+                results[gid].append(row)
+        [_.close() for _ in dbs]
+
         with open(self.out_name, "wt") as detailed:
             print(
                 *header,
                 sep="\t", file=detailed)
             for index, group in enumerate(sorted(self.sent.keys())):
-                db = dbs[self.sent[group]]
-                details = db.execute("SELECT row FROM details WHERE gid=?", (str(group),)).fetchall()
-                for detail in details:
-                    print(group, *detail[0].split("|"), sep="\t", file=detailed)
-                # if index in self.stopgaps:
-                #     self.log.info("Done {}% of the summary", self.stopgaps.index(index) * 5)
-        [_.close() for _ in dbs]
+                for detail in results[group]:
+                    print(group, *detail.split("|"), sep="\t", file=detailed)
+
         return
 
     def run(self):
@@ -474,15 +478,16 @@ def main():
             tid, group = line.rstrip().split()
             groups[group].append(tid)
 
-    formatter = logging.Formatter("{asctime} - {name} - {filename}:{lineno} - {levelname} - {funcName} \
-- {processName} - {message}",
-        style="{"
-    )
+    formatter = logging.Formatter(
+        "{asctime} - {name} - {filename}:{lineno} - {levelname} - {funcName} - {processName} - {message}",
+        style="{")
 
     logging_queue = mp.Queue(-1)
     logger = logging.getLogger("listener")
     logger.propagate = False
     log_handler = logging.StreamHandler()
+    log_handler.setFormatter(formatter)
+    logger.addHandler(log_handler)
     if args.verbose:
         level = "DEBUG"
     elif args.quiet:
@@ -490,8 +495,7 @@ def main():
     else:
         level = "INFO"
     logger.setLevel(level)
-    log_handler.setFormatter(formatter)
-    logger.addHandler(log_handler)
+
 
     # bed_db = tempfile.NamedTemporaryFile(delete=True, suffix="bed_database", prefix=".db", dir=os.getcwd())
     bed_db = args.bed12 + ".bidx"
@@ -506,12 +510,17 @@ def main():
     writer.start()
 
     send_queue = mp.Queue(-1)
+    logger.info("Starting to perform the comparisons")
 
     procs = [ComparisonWorker(bed_db, args.bed12, logging_queue, args.cdnas, send_queue, _, consider_reference=args.reference)
              for _ in range(args.threads)]
     [_.start() for _ in procs]
 
-    for group, cases in groups.items():
+    percs = [int(_) for _ in np.percentile([0, len(groups)], q=np.arange(0, 101, 10))]
+
+    for num, (group, cases) in enumerate(groups.items()):
+        if num in percs:
+            logger.info("Submitted %s%% of the groups", (percs.index(num) + 1) * 10)
         send_queue.put((group, cases))
 
     send_queue.put(("EXIT", None))
@@ -521,6 +530,7 @@ def main():
     dbnames = [_.tmp_db_name for _ in procs]
     logger.debug("DBs: {}".format(",".join([_.name for _ in dbnames])))
     dbs = [sqlite3.connect(_.name) for _ in dbnames]
+    # Sent contains, for each group, the db it is in
     sent = dict()
     for pos, db in enumerate(dbs):
         for num in db.execute("SELECT gid FROM summary").fetchall():
