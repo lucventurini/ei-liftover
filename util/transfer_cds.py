@@ -79,8 +79,9 @@ class Transferer(mp.Process):
                                                               logger=self.logger)
             target_bed.name = "ID={};coding={}".format(target_bed.name, target_bed.coding)
             if target_bed.coding:
-                target_bed.name = target_bed.name + ";phase={};original_pep_coords={}-{};original_pep_complete={}".format(
-                    target_bed.phase, *pep_coords)
+                target_bed.name = target_bed.name + \
+                                  ";phase={};original_pep_coords={}-{};original_pep_complete={}".format(
+                                      target_bed.phase, *pep_coords)
             else:
                 target_bed.thick_start, target_bed.thick_end = 1, target_bed.end
 
@@ -113,8 +114,8 @@ def transfer_by_alignment(ref_pep, target_cdna, target_bed):
         le, op = cig
         if not transfer.op_consumes[op][0]:
             # Pass by deletions
-            cig_start += 1
             translation_start += best_cigar[cig_start][0]
+            cig_start += 1
             continue
         else:
             if transfer.op_consumes[op][1]:
@@ -265,12 +266,15 @@ def transfer_cds(transcript, ref_cdna, ref_bed, target_cdna, target_bed, logger=
                     ))
                     transcript.attributes["aligner_cds"] = True
                 else:
-                    logger.info("New CDS for {}: from {}-{} to {}-{}".format(ref_bed.chrom,
-                                                                       orig_start, orig_end,
-                                                                       target_bed.thick_start, target_bed.thick_end))
+                    logger.info("New CDS for {} onto {}: from {}-{} to {}-{}".format(ref_bed.chrom,
+                                                                                     target_bed.chrom,
+                                                                                     orig_start, orig_end,
+                                                                                     target_bed.thick_start,
+                                                                                     target_bed.thick_end))
                 transcript.load_orfs([target_bed])
             else:
-                logger.info("No CDS transferred for {} onto its mapping {}".format(ref_bed.chrom, target_bed.chrom))
+                logger.info("No CDS transferred for {} onto its mapping {}. Invalid reason: {}".format(
+                    ref_bed.chrom, target_bed.chrom, target_bed.invalid_reason))
 
     if pep_coords:
         pep_coords = (pep_coords[0], pep_coords[1], (pep_coords[0] == 1 and pep_coords[1] == len(ref_pep)))
