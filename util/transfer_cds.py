@@ -9,6 +9,7 @@ import pyfaidx
 from Mikado.parsers.bed12 import BED12, Bed12Parser
 from Mikado.parsers.GFF import GFF3
 from Mikado.transcripts import Transcript
+from Mikado.utilities.log_utils import create_default_logger
 from Bio import Seq
 import parasail
 import multiprocessing as mp
@@ -276,8 +277,18 @@ def main():
     parser.add_argument("-ob", "--out-bed", dest="out_bed", required=False,
                         default=None,
                         type=argparse.FileType("wt"))
+    log = parser.add_mutually_exclusive_group()
+    log.add_argument("-q", "--quiet", default=False, action="store_true")
+    log.add_argument("-v", "--verbose", default=False, action="store_true")
     parser.add_argument("-p", "--processes", type=int, default=mp.cpu_count())
     args = parser.parse_args()
+
+    logger = create_default_logger("master")
+    verbosity = "INFO"
+    if args.verbose is True:
+        verbosity = "DEBUG"
+    else:
+        verbosity = "WARNING"
 
     cdnas = dict()
     beds = dict()
@@ -286,8 +297,12 @@ def main():
 
     gmap_pat = re.compile("\.mrna[0-9]*$")
 
+    logger.info("Loading reference cDNAS")
     cdnas["ref"] = pyfaidx.Fasta(args.cdnas[0])
+    logger.info("Loading target cDNAS")
     cdnas["target"] = pyfaidx.Fasta(args.cdnas[1])
+    logger.info("Loaded cDNAs")
+    logger.info("Loading reference BED12")
     for entry in Bed12Parser(args.bed12[0], transcriptomic=True):
         if entry.header:
             continue
@@ -298,6 +313,7 @@ def main():
             raise KeyError("Reference {} not found in the cDNAs!".format(name))
         beds["ref"][name] = entry
 
+    logger.info("Loading target BED12")
     beds["target"] = defaultdict(dict)
     for entry in Bed12Parser(args.bed12[1], transcriptomic=True):
         # Now, here we have to account for the fact that there *might* be multiple alignments
@@ -305,10 +321,12 @@ def main():
         if entry.chrom not in cdnas["target"]:
             raise KeyError("Target {} not found in the cDNAs!".format(entry.chrom))
         beds["target"][name][entry.chrom] = entry
+    logger.info("Loaded BED12s")
 
     # Now let us start parsing the GFF3, which we presume being a GMAP GFF3
     transcript = None
 
+    logger.info("Launching sub-processes")
     procs = []
     queue = mp.Queue(-1)
     for proc in range(args.processes):
@@ -318,6 +336,7 @@ def main():
         _proc = Transferer(sq, queue)
         _proc.start()
         procs.append(_proc)
+    logger.info("Launched sub-processes, starting parsing annotation")
 
     # pool = mp.Pool(processes=args.processes)
 
@@ -340,6 +359,9 @@ def main():
                             ref_cdna, ref_bed,
                             target_cdna, target_bed)
                            ))
+            if tnum >= 10 ** 4 and tnum % 10 ** 4 == 0:
+                logger.info("Parsed {} transcripts", tnum)
+        logger.info("Finished parsing input genomic BED file")
     else:
         parser = GFF3(args.gf)
 
@@ -363,6 +385,8 @@ def main():
                 transcript = Transcript(line)
             elif line.is_exon is True:
                 transcript.add_exon(line)
+            if tnum >= 10 ** 4 and tnum % 10 ** 4 == 0:
+                logger.info("Parsed {} transcripts", tnum)
 
         if transcript:
             tnum += 1
@@ -376,13 +400,16 @@ def main():
                         ref_cdna, ref_bed,
                         target_cdna, target_bed)
                        ))
+        logger.info("Finished parsing input genomic GF file")
 
     queue.put("EXIT")
+    logger.info("Waiting for subprocesses to finish")
     [_proc.join() for _proc in procs]
 
     # Now the printing ...
     # results = dict()
 
+    logger.info("Subprocesses finished, printing")
     for proc in procs:
         sq = sqlalchemy.create_engine("sqlite:///{}".format(proc.out_sq))
         for res in sq.execute("select * from storer"):
@@ -392,6 +419,7 @@ def main():
             print(*gff3.decode().split("\n"), file=args.out, sep="\n")
         os.remove(proc.out_sq)
 
+    logger.info("Finished!")
     return
 
 
