@@ -96,19 +96,22 @@ def transfer_by_alignment(ref_pep, target_cdna, target_bed):
         frames[frame] = str(Seq.Seq(str(target_cdna[frame:])).translate(to_stop=False))
 
     # This will get the best match in the 3-frame translation
-    aln, best_frame, score, best_cigar = None, None, float("-inf"), None
+    frame_res = dict()
     for frame in frames:
         res, cigar = transfer.get_and_prepare_cigar(ref_pep,
                                                     frames[frame],
                                                     open=3,
                                                     extend=1,
                                                     matrix=parasail.blosum85)
-        if res.score > score:
-            aln, best_frame, score, best_cigar = res, frame, res.score, cigar
+        frame_res[frame] = (res, cigar)
+
 
     # Now it is time to try to transfer it ... Ignore any deletions at the beginning
     cig_start = 0
     translation_start = 0
+    best_frame = sorted(frame_res.keys(), key=lambda k: frame_res[k][0].score, reverse=True)[0]
+
+    best_cigar = frame_res[best_frame][1]
 
     for cig_pos, cig in enumerate(best_cigar):
         le, op = cig
@@ -127,7 +130,7 @@ def transfer_by_alignment(ref_pep, target_cdna, target_bed):
 
     # This is 0-based; we have to add 1 because we start 1 base after the gap at the beginning
     if translation_start > 0:
-        translation_start = 3 * translation_start + 1
+        translation_start = 3 * translation_start + best_frame
     else:
         # We have to account for the frame!
         translation_start = best_frame
