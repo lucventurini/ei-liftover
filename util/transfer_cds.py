@@ -9,10 +9,12 @@ import pyfaidx
 from Mikado.parsers.bed12 import BED12, Bed12Parser
 from Mikado.parsers.GFF import GFF3
 from Mikado.transcripts import Transcript
-from Mikado.utilities.log_utils import create_default_logger
+from Mikado.utilities.log_utils import create_default_logger, create_queue_logger, create_null_logger
 from Bio import Seq
 import parasail
 import multiprocessing as mp
+import logging
+import logging.handlers
 import sqlalchemy
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy import Integer, Column, BLOB
@@ -25,6 +27,11 @@ from collections import defaultdict
 __doc__ = """Script to try to translate the CDS from one coordinate system to another."""
 
 transfer_base = declarative_base()
+
+logging_queue = mp.JoinableQueue(-1)
+log_queue_handler = logging.handlers.QueueHandler(logging_queue)
+log_queue_handler.setLevel(logging.DEBUG)
+
 
 
 class _Storer(transfer_base):
@@ -42,10 +49,13 @@ class _Storer(transfer_base):
 
 class Transferer(mp.Process):
 
-    def __init__(self, out_sq, queue):
+    def __init__(self, out_sq, queue, verbosity="INFO"):
 
         super().__init__()
         self.out_sq = out_sq
+        self.logging_queue = logging_queue
+        self.log_level = verbosity
+        create_queue_logger(self)
         self.engine = sqlalchemy.create_engine("sqlite:///{}".format(out_sq))
         transfer_base.metadata.create_all(self.engine)
         self.Session = sessionmaker(bind=self.engine)
@@ -65,7 +75,8 @@ class Transferer(mp.Process):
              ref_cdna, ref_bed,
              target_cdna, target_bed) = obj_input
 
-            transcript, target_bed, pep_coords = transfer_cds(transcript, ref_cdna, ref_bed, target_cdna, target_bed)
+            transcript, target_bed, pep_coords = transfer_cds(transcript, ref_cdna, ref_bed, target_cdna, target_bed,
+                                                              logger=self.logger)
             target_bed.name = "ID={};coding={}".format(target_bed.name, target_bed.coding)
             if target_bed.coding:
                 target_bed.name = target_bed.name + ";phase={};original_pep_coords={}-{};original_pep_complete={}".format(
@@ -165,7 +176,7 @@ def transfer_by_alignment(ref_pep, target_cdna, target_bed):
     return target_bed, (pep_start, pep_end)
 
 
-def transfer_cds(transcript, ref_cdna, ref_bed, target_cdna, target_bed):
+def transfer_cds(transcript, ref_cdna, ref_bed, target_cdna, target_bed, logger=create_null_logger()):
 
     if transcript is None:
         return
@@ -215,7 +226,7 @@ def transfer_cds(transcript, ref_cdna, ref_bed, target_cdna, target_bed):
     if not replace:
         transcript.attributes["original_cds"] = True
         transcript.attributes["aligner_cds"] = True
-        print("CDS transferred correctly for {}".format(ref_bed.chrom))
+        logger.info("CDS transferred correctly for {}".format(ref_bed.chrom))
 
     else:
         transcript.strip_cds()
@@ -229,7 +240,7 @@ def transfer_cds(transcript, ref_cdna, ref_bed, target_cdna, target_bed):
         else:
             valid = False
         if valid:
-            print("Transferred original CDS for {}: from {}-{} to {}-{}".format(ref_bed.chrom,
+            logger.info("Transferred original CDS for {}: from {}-{} to {}-{}".format(ref_bed.chrom,
                                                                orig_start, orig_end,
                                                                target_bed.thick_start, target_bed.thick_end))
 
@@ -247,19 +258,19 @@ def transfer_cds(transcript, ref_cdna, ref_bed, target_cdna, target_bed):
                 transcript.attributes["original_pep_coords"] = "{}-{}".format(*pep_coords)
                 transcript.attributes["original_pep_complete"] = (pep_coords[0] == 1 and pep_coords[1] == len(ref_pep))
                 if (orig_start, orig_end) == (target_bed.thick_start, target_bed.thick_end) and was_coding:
-                    print("GMAP corrected the CDS and phase for {}: from {}-{} to {}-{}".format(
+                    logger.info("GMAP corrected the CDS and phase for {}: from {}-{} to {}-{}".format(
                         ref_bed.chrom,
                         recalc_coords[0], recalc_coords[1],
                         target_bed.thick_start, target_bed.thick_end
                     ))
                     transcript.attributes["aligner_cds"] = True
                 else:
-                    print("New CDS for {}: from {}-{} to {}-{}".format(ref_bed.chrom,
+                    logger.info("New CDS for {}: from {}-{} to {}-{}".format(ref_bed.chrom,
                                                                        orig_start, orig_end,
                                                                        target_bed.thick_start, target_bed.thick_end))
                 transcript.load_orfs([target_bed])
             else:
-                print("No CDS transferred for {} onto its mapping {}".format(ref_bed.chrom, target_bed.chrom))
+                logger.info("No CDS transferred for {} onto its mapping {}".format(ref_bed.chrom, target_bed.chrom))
 
     if pep_coords:
         pep_coords = (pep_coords[0], pep_coords[1], (pep_coords[0] == 1 and pep_coords[1] == len(ref_pep)))
@@ -287,8 +298,13 @@ def main():
     verbosity = "INFO"
     if args.verbose is True:
         verbosity = "DEBUG"
-    else:
+    elif args.quiet is True:
         verbosity = "WARNING"
+
+    listener = logging.handlers.QueueListener(logging_queue, logger)
+    listener.propagate = False
+    listener.start()
+    logger.setLevel(verbosity)
 
     cdnas = dict()
     beds = dict()
@@ -333,7 +349,7 @@ def main():
         sq = tempfile.NamedTemporaryFile(mode="wb")
         sq.close()
         sq = sq.name
-        _proc = Transferer(sq, queue)
+        _proc = Transferer(sq, queue, verbosity=verbosity)
         _proc.start()
         procs.append(_proc)
     logger.info("Launched sub-processes, starting parsing annotation")
