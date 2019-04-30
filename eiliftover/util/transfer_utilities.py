@@ -24,7 +24,7 @@ def get_and_prepare_cigar(seq1, seq2, open=11, extend=1, matrix=parasail.blosum6
 
     """
 
-    result = parasail.sg_trace_scan_32(seq1, seq2, open, extend, matrix)
+    result = parasail.sg_trace_scan_sat(seq1, seq2, open, extend, matrix)
     values = re.split(cigar_pattern, result.cigar.decode.decode())
     values = [(int(values[_ * 2]), values[_ * 2 + 1]) for _ in range(int((len(values) - 1) / 2))]
     return result, values

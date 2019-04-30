@@ -121,11 +121,21 @@ class ComparisonWorker(mp.Process):
         cdna = str(self.fai[transcript]).upper()
         bed_position = self.__found_in_bed[transcript]
         self.bedfile.seek(bed_position)
-        bed = BED12(self.bedfile.readline())
+        line = self.bedfile.readline()
+        bed = BED12(line)
         assert bed.name == transcript, (bed.name, transcript, bed_position)
-        bed = bed.to_transcriptomic(sequence=cdna)
-        pep = str(Seq.Seq(str(cdna[max(0 + bed.phase, bed.thick_start - 1):bed.thick_end])).translate())
-        return cdna, bed, pep
+
+        new_bed = bed.to_transcriptomic(sequence=cdna, lenient=True)
+        if new_bed.coding is False and bed.coding is True:
+            raise AssertionError("The transcriptomic BED has been transformed incorrectly. Reason: {}".format(
+                new_bed.invalid_reason
+            ))
+        if bed.phase and new_bed.phase != bed.phase:
+            raise AssertionError("The transcriptomic BED has been transformed incorrectly. Phases: {}, {}, {}".format(
+                new_bed.phase, bed.phase, line
+            ))
+        pep = str(Seq.Seq(str(cdna[max(0 + new_bed.phase, new_bed.thick_start - 1):new_bed.thick_end])).translate())
+        return cdna, new_bed, pep
 
     @classmethod
     def transfer_exon_coordinates(cls, cigar, query_exons, target_exons):
@@ -160,6 +170,7 @@ class ComparisonWorker(mp.Process):
     def run(self):
 
         self.__found_in_bed = dict(_ for _ in self.bed12records.execute("SELECT name, start from bed"))
+        self.log.info("Loading FAI for {}".format(self.cdnas))
         self.fai = pyfaidx.Fasta(self.cdnas)
         self.log.debug("Finished loading information for the process")
         
@@ -180,7 +191,6 @@ class ComparisonWorker(mp.Process):
                             raise TypeError(detail)
                         self.tmp_db.execute("INSERT INTO details VALUES (?, ?)", (group, row))
 
-                    # [self.tmp_db.execute("INSERT INTO details VALUES (?, ?)", (group, "|".join(_))) for _ in details]
                     self.tmp_db.execute("INSERT INTO summary VALUES (?, ?)", (group, "|".join(summary)))
                     self.tmp_db.commit()
             continue
@@ -206,21 +216,22 @@ class ComparisonWorker(mp.Process):
 
         # Common: list(zip(query_array, target_array))
 
-        identical = sum(length for length, op in cigar if op in ("M", "="))
+        identical = sum(length for length, op in cigar if op in ("=",))
         if identical == 0:
-            raise ValueError(cigar)
-        identity = round(100 * identical / len(common), 2)
+            identity = 0
+        else:
+            identity = round(100 * identical / len(common), 2)
         result = array_compare(np.ravel(np.array(c_t1_exons)),
                                np.ravel(np.array(c_t2_exons)), identity)
         result, ccode = result[:-1].reshape((2, 3)), int(result[-1])
         # Now that we have analysed the cDNAs, it is time for the CDS
 
-        if t1bed.coding and t2bed.coding and all(peps):
+        if identity > 0 and t1bed.coding and t2bed.coding and all(peps):
 
             t1_coding_exons = [(max(t1bed.thick_start - 1, _[0]), min(t1bed.thick_end, _[1])) for _ in t1bed.blocks
                                if overlap(_, (t1bed.thick_start - 1, t1bed.thick_end)) > 0]
-            assert t1_coding_exons, (
-            t1bed.blocks, t1bed.block_starts, t1bed.block_sizes, t1bed.thick_start, t1bed.thick_end)
+            assert t1_coding_exons, (t1bed.blocks, t1bed.block_starts, t1bed.block_sizes,
+                                     t1bed.thick_start, t1bed.thick_end)
             t2_coding_exons = [(max(t2bed.thick_start - 1, _[0]), min(t2bed.thick_end, _[1])) for _ in t2bed.blocks
                                if overlap(_, (t2bed.thick_start - 1, t2bed.thick_end)) > 0]
             assert t2_coding_exons
@@ -237,10 +248,10 @@ class ComparisonWorker(mp.Process):
 
             coding_result, coding_cigar = transfer.get_and_prepare_cigar(t1pep, t2pep)
             coding_common = transfer.cigar_length_in_common(coding_cigar)
-            coding_identical = sum(length for length, op in coding_cigar if op in ("M", "="))
+            coding_identical = sum(length for length, op in coding_cigar if op in ("=", "M"))
             if coding_identical == 0:
-                self.log.warning("No protein overlap at all for %s and %s",
-                                 t1bed.name, t2bed.name)
+                self.log.warning("No protein overlap at all for %s and %s.\nProtein 1: %s\nProtein 2: %s",
+                                 t1bed.name, t2bed.name, t1pep, t2pep)
                 c_t1_coding = "NA"
                 c_t2_coding = "NA"
                 coding_identity = 0
@@ -273,31 +284,39 @@ class ComparisonWorker(mp.Process):
         # Get the results for the cDNAs
         # beds = [beds[0].to_transcriptomic(sequence=cdnas[0]), beds[1].to_transcriptomic(sequence=cdnas[1])]
 
-        c_t1_exons, c_t2_exons, identity, result, ccode, \
-            c_t1_coding, c_t2_coding, coding_identity, coding_result, coding_ccode = self._analyse_cDNAs(cdnas,
-                                                                                                         beds,
-                                                                                                         peps)
-        # Now let's get the results for the proteins
+        self.log.debug("%s coding: %s, %s coding: %s", t1, beds[0].coding, t2, beds[1].coding)
 
-        if ccode > 0:
-            ccode = chr(ccode)
-        else:
+        try:
+            c_t1_exons, c_t2_exons, identity, result, ccode, \
+                c_t1_coding, c_t2_coding, coding_identity, coding_result, coding_ccode = self._analyse_cDNAs(cdnas,
+                                                                                                             beds,
+                                                                                                             peps)
+            if ccode > 0:
+                ccode = chr(ccode)
+            else:
+                ccode = "NA"
+            if coding_ccode > 0:
+                coding_ccode = chr(coding_ccode)
+            else:
+                coding_ccode = "NA"
+
+            deta = (t1, str(c_t1_exons), t2, str(c_t2_exons), identity,  # c_t1_exons, c_t2_exons,
+                    *["{:0.2f}".format(100 * _) for _ in result[0]],
+                    *["{:0.2f}".format(100 * _) for _ in result[1]],
+                    ccode,
+                    c_t1_coding, c_t2_coding,
+                    coding_identity,
+                    *["{:0.2f}".format(100 * _) for _ in coding_result[0]],
+                    *["{:0.2f}".format(100 * _) for _ in coding_result[1]],
+                    coding_ccode)
+            deta = (str(_) for _ in deta)
+        except ValueError:
             ccode = "NA"
-        if coding_ccode > 0:
-            coding_ccode = chr(coding_ccode)
-        else:
             coding_ccode = "NA"
+            c_t1_exons, c_t2_exons, common = self.transfer_exon_coordinates(t1, t2, t2bed.blocks)
 
-        deta = (t1, str(c_t1_exons), t2, str(c_t2_exons), identity,  # c_t1_exons, c_t2_exons,
-                *["{:0.2f}".format(100 * _) for _ in result[0]],
-                *["{:0.2f}".format(100 * _) for _ in result[1]],
-                ccode,
-                c_t1_coding, c_t2_coding,
-                coding_identity,
-                *["{:0.2f}".format(100 * _) for _ in coding_result[0]],
-                *["{:0.2f}".format(100 * _) for _ in coding_result[1]],
-                coding_ccode)
-        deta = (str(_) for _ in deta)
+
+        # Now let's get the results for the proteins
 
         return deta, result, identity, coding_result, coding_identity
 
@@ -318,8 +337,11 @@ class ComparisonWorker(mp.Process):
 
         self.log.debug("Group %s: cases %s", group, ", ".join(cases))
         for tid in cases:
-            if tid not in self.fai or tid not in self.__found_in_bed:
-                self.log.warning("%s not found among records for group %s, expunging.", tid, group)
+            if tid not in self.fai:
+                self.log.warning("%s not found in FASTA for group %s, expunging.", tid, group)
+                to_remove.add(tid)
+            elif tid not in self.__found_in_bed:
+                self.log.warning("%s not found among BED records for group %s, expunging.", tid, group)
                 to_remove.add(tid)
 
         if len(cases) - len(to_remove) < 2:
@@ -338,7 +360,8 @@ class ComparisonWorker(mp.Process):
         
         for comb in combs:
             self.log.debug("Combination: %s, %s", *comb)
-            deta, result, identity, coding_result, coding_identity = self._analyse_combination(data[comb[0]], data[comb[1]])
+            deta, result, identity, coding_result, coding_identity = self._analyse_combination(data[comb[0]],
+                                                                                               data[comb[1]])
 
             details.append(deta)
             exon_f1.append(result[0][2])
@@ -496,8 +519,6 @@ def main():
         level = "INFO"
     logger.setLevel(level)
 
-
-    # bed_db = tempfile.NamedTemporaryFile(delete=True, suffix="bed_database", prefix=".db", dir=os.getcwd())
     bed_db = args.bed12 + ".bidx"
     if not os.path.exists(bed_db) or os.stat(bed_db).st_ctime < os.stat(args.bed12).st_ctime:
         # print(bed_db)
@@ -512,7 +533,8 @@ def main():
     send_queue = mp.Queue(-1)
     logger.info("Starting to perform the comparisons")
 
-    procs = [ComparisonWorker(bed_db, args.bed12, logging_queue, args.cdnas, send_queue, _, consider_reference=args.reference)
+    procs = [ComparisonWorker(bed_db, args.bed12, logging_queue, args.cdnas, send_queue, _,
+                              consider_reference=args.reference)
              for _ in range(args.threads)]
     [_.start() for _ in procs]
 

@@ -7,8 +7,9 @@ from eiliftover.util import transfer_utilities as transfer
 import re
 import pyfaidx
 from Mikado.parsers.bed12 import BED12, Bed12Parser
-from Mikado.parsers.GFF import GFF3
+from Mikado.parsers import to_gff
 from Mikado.transcripts import Transcript
+from Mikado.loci import Gene
 from Mikado.utilities.log_utils import create_default_logger, create_queue_logger, create_null_logger
 from Bio import Seq
 import parasail
@@ -22,6 +23,7 @@ from sqlalchemy.orm import sessionmaker
 import tempfile
 import os
 from collections import defaultdict
+import operator
 
 
 __doc__ = """Script to try to translate the CDS from one coordinate system to another."""
@@ -31,7 +33,6 @@ transfer_base = declarative_base()
 logging_queue = mp.JoinableQueue(-1)
 log_queue_handler = logging.handlers.QueueHandler(logging_queue)
 log_queue_handler.setLevel(logging.DEBUG)
-
 
 
 class _Storer(transfer_base):
@@ -54,6 +55,7 @@ class Transferer(mp.Process):
         super().__init__()
         self.out_sq = out_sq
         self.logging_queue = logging_queue
+        self.logger = create_default_logger("")
         self.log_level = verbosity
         create_queue_logger(self)
         self.engine = sqlalchemy.create_engine("sqlite:///{}".format(out_sq))
@@ -64,6 +66,7 @@ class Transferer(mp.Process):
 
     def run(self):
 
+        self.logger.debug("Starting to wait in the queue")
         while True:
             obj_input = self.queue.get()
             if obj_input == "EXIT":
@@ -74,7 +77,6 @@ class Transferer(mp.Process):
             num_id, (transcript,
              ref_cdna, ref_bed,
              target_cdna, target_bed) = obj_input
-
             transcript, target_bed, pep_coords = transfer_cds(transcript, ref_cdna, ref_bed, target_cdna, target_bed,
                                                               logger=self.logger)
             target_bed.name = "ID={};coding={}".format(target_bed.name, target_bed.coding)
@@ -84,14 +86,17 @@ class Transferer(mp.Process):
                                       target_bed.phase, *pep_coords)
             else:
                 target_bed.thick_start, target_bed.thick_end = 1, target_bed.end
+            gene = Gene(transcript)
+            gene.finalize()
 
-            self.session.add(_Storer(num_id, str(target_bed).encode(), transcript.format("gff3").encode()))
+            self.session.add(_Storer(num_id, str(target_bed).encode(), gene.format("gff3").encode()))
             self.session.commit()
 
 
-def transfer_by_alignment(ref_pep, target_cdna, target_bed):
+def transfer_by_alignment(ref_pep, target_cdna, target_bed, logger=create_null_logger()):
     frames = dict()
     # Get the three-frame translation
+    logger.debug("Phase for %s: %s", target_bed.name, target_bed.phase)
     for frame in range(3):
         frames[frame] = str(Seq.Seq(str(target_cdna[frame:])).translate(to_stop=False))
 
@@ -104,14 +109,13 @@ def transfer_by_alignment(ref_pep, target_cdna, target_bed):
                                                     extend=1,
                                                     matrix=parasail.blosum85)
         frame_res[frame] = (res, cigar)
-
-
     # Now it is time to try to transfer it ... Ignore any deletions at the beginning
     cig_start = 0
     translation_start = 0
+    logger.debug("Frames for %s (phase %s): %s", target_bed.name, target_bed.phase, frame_res)
     best_frame = sorted(frame_res.keys(), key=lambda k: frame_res[k][0].score, reverse=True)[0]
-
     best_cigar = frame_res[best_frame][1]
+    logger.debug("Best frame for %s: %s (cigar: %s)", target_bed.name, best_frame, best_cigar)
 
     for cig_pos, cig in enumerate(best_cigar):
         le, op = cig
@@ -129,29 +133,31 @@ def transfer_by_alignment(ref_pep, target_cdna, target_bed):
                 continue
 
     # This is 0-based; we have to add 1 because we start 1 base after the gap at the beginning
+    logger.debug("Translation start for %s: %s; phase: %s", target_bed.name, translation_start, target_bed.phase)
     if translation_start > 0:
         translation_start = 3 * translation_start + best_frame
     else:
         # We have to account for the frame!
         translation_start = best_frame
 
-    translated = str(Seq.Seq(str(target_cdna[translation_start:])).translate(to_stop=True))
+    translated = str(Seq.Seq(str(target_cdna[translation_start:])).translate(to_stop=(ref_pep.count("*") <= 1)))
 
     # Logic to handle when the CDS is broken
     # This is 1-based, so we have to add 1 to
     target_bed.thick_start = translation_start + 1
     end = target_bed.thick_start + len(translated) * 3 - 1
 
+    logger.debug("Phase for %s: %s", target_bed.name, target_bed.phase)
     if translated and translated[0] != ref_pep[0]:
         if translation_start in (0, 1, 2):
             target_bed.phase = translation_start
             target_bed.thick_start = 1
         else:
             target_bed.coding = False
-            return target_bed, ()
+            return target_bed, (None, None, False)
     elif not translated:
         target_bed.coding = False
-        return target_bed, ()
+        return target_bed, (None, None, False)
 
     # Get the coordinates on the original protein
 
@@ -177,110 +183,86 @@ def transfer_by_alignment(ref_pep, target_cdna, target_bed):
     target_bed.thick_end = end
     target_bed.coding = True
     target_bed.transcriptomic = True
+    logger.debug("Phase for %s: %s", target_bed.name, target_bed.phase)
     return target_bed, (pep_start, pep_end)
 
 
-def transfer_cds(transcript, ref_cdna, ref_bed, target_cdna, target_bed, logger=create_null_logger()):
+def transfer_cds(transcript: Transcript, ref_cdna: str, ref_bed: BED12,
+                 target_cdna: str, target_bed: BED12, logger=create_null_logger()):
 
     if transcript is None:
-        return
+        return transcript, target_bed, (None, None, False)
 
     transcript.finalize()
     assert target_bed.transcriptomic is True
-    was_coding = target_bed.coding
 
-    orig_start, orig_end = target_bed.thick_start, target_bed.thick_end
+    logger.debug("Starting with %s, phases: %s (BED %s)", transcript.id, transcript.phases, target_bed.phase)
 
-    result, cigar = transfer.get_and_prepare_cigar(str(ref_cdna), str(target_cdna))
-    ref_array, target_array = transfer.create_translation_array(cigar)
-
-    ref_pep = str(Seq.Seq(str(ref_cdna[ref_bed.thick_start - 1:ref_bed.thick_end])).translate())
-
-    # target_start, target_end = None, None
-
-    try:
-        target_start = target_array[ref_array.index(ref_bed.thick_start)]
-    except IndexError:
-        target_start = target_bed.start
-    try:
-        target_end = target_array[ref_array.index(ref_bed.thick_end)]
-    except IndexError:
-        target_end = target_bed.end
-
-    # Let us check that the protein is functional ...
-
-    replace = True
-
-    if target_bed.coding is True:
-        if target_start is not None and target_end is not None:
-            if target_start == target_bed.thick_start and target_end == target_bed.thick_end:
-                replace = False  # Everything fine here
-            else:
-                target_pep = str(Seq.Seq(str(target_cdna[target_start - 1:target_end])).translate())
-                if (target_pep[0] == ref_pep[0] and target_pep[-1] == ref_pep[-1] and
-                        ((ref_pep[-1] == "*" and target_pep.count("*") == 1) or target_pep.count("*") == 0)):
-                    target_bed.thick_start, target_bed.thick_end = target_start, target_end
-                else:
-                    target_bed.coding = False
-        else:
-            target_bed.coding = False
-
-    # We presume it is correct
-    pep_coords = (1, len(ref_pep))
-    if not replace:
-        transcript.attributes["original_cds"] = True
-        transcript.attributes["aligner_cds"] = True
-        logger.info("CDS transferred correctly for {}".format(ref_bed.chrom))
-
-    else:
-        transcript.strip_cds()
-        transcript.attributes["original_cds"] = True
+    if ref_bed.coding is False:
+        logger.debug("%s is non coding, returning immediately.", transcript.id, transcript.phases)
         transcript.attributes["aligner_cds"] = False
-        if target_bed.coding is True:
-            try:
-                valid = (not target_bed.invalid)
-            except:
-                valid = False
+        transcript.attributes["was_coding"] = transcript.is_coding
+        target_bed.coding = False
+        transcript.strip_cds()
+        pep_coords = (None, None, True)
+    else:
+        original_start, original_end = target_bed.thick_start, target_bed.thick_end
+        original_phase, original_phases = target_bed.phase, transcript.phases.copy()
+        ref_pep = str(Seq.Seq(str(ref_cdna[ref_bed.thick_start - 1:ref_bed.thick_end])).translate(to_stop=False))
+
+        ref_has_multiple_stops = False
+        if ref_pep.count("*") == 0:
+            pass
+        elif abs(ref_pep.index("*") * 3 - ref_bed.cds_len) in (0, 3):
+            ref_pep = ref_pep[:ref_pep.index("*")]  # This is the "good" case: the CDS is correct.
         else:
-            valid = False
-        if valid:
-            logger.info("Transferred original CDS for {}: from {}-{} to {}-{}".format(ref_bed.chrom,
-                                                               orig_start, orig_end,
-                                                               target_bed.thick_start, target_bed.thick_end))
+            ref_has_multiple_stops = True
+            logger.warning(
+                "The sequence of %s has in frame stop codons. Adjusting the program to take this into account.",
+                ref_bed.name)
 
-            transcript.load_orfs([target_bed])
-
-        else:
-            # Here we try to transfer the CDS through alignment
-            transcript.attributes["original_cds"] = False
-            transcript.attributes["original_cds_coords"] = "{}-{}".format(target_start, target_end)
-            recalc_coords = (target_bed.thick_start, target_bed.thick_end)
-            target_bed, pep_coords = transfer_by_alignment(ref_pep, target_cdna, target_bed)
-            # Let's see what happens when we just use the transferred cDNA start
-
-            if target_bed.coding is True and target_bed.invalid is False:
-                transcript.attributes["original_pep_coords"] = "{}-{}".format(*pep_coords)
-                transcript.attributes["original_pep_complete"] = (pep_coords[0] == 1 and pep_coords[1] == len(ref_pep))
-                if (orig_start, orig_end) == (target_bed.thick_start, target_bed.thick_end) and was_coding:
-                    logger.info("GMAP corrected the CDS and phase for {}: from {}-{} to {}-{}".format(
-                        ref_bed.chrom,
-                        recalc_coords[0], recalc_coords[1],
-                        target_bed.thick_start, target_bed.thick_end
-                    ))
-                    transcript.attributes["aligner_cds"] = True
-                else:
-                    logger.info("New CDS for {} onto {}: from {}-{} to {}-{}".format(ref_bed.chrom,
-                                                                                     target_bed.chrom,
-                                                                                     orig_start, orig_end,
-                                                                                     target_bed.thick_start,
-                                                                                     target_bed.thick_end))
-                transcript.load_orfs([target_bed])
-            else:
-                logger.info("No CDS transferred for {} onto its mapping {}. Invalid reason: {}".format(
-                    ref_bed.chrom, target_bed.chrom, target_bed.invalid_reason))
-
-    if pep_coords:
+        logger.debug("%s now has phases: %s (%s)", transcript.id, transcript.phases, target_bed.phase)
+        target_bed, pep_coords = transfer_by_alignment(ref_pep, target_cdna, target_bed, logger=logger)
+        logger.debug("%s now has phases: %s; target bed: %s", transcript.id, transcript.phases, target_bed.phase)
         pep_coords = (pep_coords[0], pep_coords[1], (pep_coords[0] == 1 and pep_coords[1] == len(ref_pep)))
+
+        if target_bed.thick_start == original_start and target_bed.thick_end == original_end:
+            transcript.attributes["aligner_cds"] = True
+            logger.debug("%s now has phases: %s", transcript.id, transcript.phases)
+        else:
+            transcript.attributes["aligner_cds"] = False
+            transcript.strip_cds()
+            if target_bed.coding is True:
+                transcript.load_orfs([target_bed])
+
+        logger.debug("%s now has phases: %s", transcript.id, transcript.phases)
+        # Now we have to decide whether the transcript has the "original" CDS or not
+        result, cigar = transfer.get_and_prepare_cigar(str(ref_cdna), str(target_cdna))
+        ref_array, target_array = transfer.create_translation_array(cigar)
+        try:
+            target_start = target_array[ref_array.index(ref_bed.thick_start)]
+        except IndexError:
+            target_start = target_bed.start
+        try:
+            target_end = target_array[ref_array.index(ref_bed.thick_end)]
+        except IndexError:
+            target_end = target_bed.end
+
+        if target_start == target_bed.thick_start and target_end == target_bed.thick_end:
+            transcript.attributes["original_cds"] = True
+        else:
+            transcript.attributes["original_cds"] = False
+
+        if ref_cdna == target_cdna:
+            logger.debug("%s now has phases: %s", transcript.id, transcript.phases)
+            if transcript.is_coding is False:
+                raise AssertionError("{} not coding".format(transcript.id))
+            elif transcript.attributes["original_cds"] is False:
+                raise AssertionError("\n".join([str(_) for _ in [transcript.id,
+                    (target_bed.thick_start, target_start, target_bed.thick_start == target_start),
+                                            (target_bed.thick_end, target_end, target_bed.thick_end == target_end),
+                                            target_bed.thick_start == target_start and target_bed.thick_end == target_end
+                                            ]]))
 
     return transcript, target_bed, pep_coords
 
@@ -364,7 +346,7 @@ def main():
     # pool = mp.Pool(processes=args.processes)
 
     tnum = -1
-    if args.gf.endswith("bed12"):
+    if args.gf.endswith(("bed12", "bed")):
         parser = Bed12Parser(args.gf, transcriptomic=False)
         for line in parser:
             if line.header:
@@ -372,11 +354,13 @@ def main():
             else:
                 transcript = Transcript(line)
                 tid = re.sub(gmap_pat, "", transcript.id)
+                logger.debug("Found %s", tid)
                 ref_cdna = str(cdnas["ref"][tid])
                 ref_bed = beds["ref"][tid]
                 target_cdna = str(cdnas["target"][transcript.id])
                 target_bed = beds["target"][tid][transcript.id]
                 tnum += 1
+                logger.debug("Submitting %s", tid)
                 queue.put((tnum,
                            (transcript,
                             ref_cdna, ref_bed,
@@ -386,26 +370,44 @@ def main():
                 logger.info("Parsed {} transcripts", tnum)
         logger.info("Finished parsing input genomic BED file")
     else:
-        parser = GFF3(args.gf)
+        parser = to_gff(args.gf)
 
-        for line in parser:
-            if line.header is True or not isinstance(line, BED12) and line.gene is True:
-                print(line, file=args.out)
+        for pos, line in enumerate(parser):
+            if line.header is True:  # or (not isinstance(line, BED12) and line.is_gene is True):
+                if str(line) == "###":
+                    continue
+                try:
+                    print(line, file=args.out)
+                except IndexError:
+                    raise IndexError(line._line)
+                continue
+            elif not isinstance(line, BED12) and line.is_gene is True:
                 continue
             elif line.is_transcript is True:
                 if transcript:
-                    tid = re.sub(gmap_pat, "", transcript.id)
+                    if transcript.alias is None:
+                        tid = re.sub(gmap_pat, "", transcript.id)
+                    else:
+                        tid = re.sub(gmap_pat, "", transcript.alias)
                     ref_cdna = str(cdnas["ref"][tid])
                     ref_bed = beds["ref"][tid]
                     target_cdna = str(cdnas["target"][transcript.id])
-                    target_bed = beds["target"][tid][transcript.id]
+                    store = beds["target"].get(tid, None)
+                    if store is None:
+                        raise KeyError((tid, beds["target"].keys()))
+                    target_bed = store.get(transcript.id, None)
+                    if target_bed is None:
+                        raise KeyError((tid, store.keys()))
                     tnum += 1
                     queue.put((tnum,
                                (transcript,
                                 ref_cdna, ref_bed,
                                 target_cdna, target_bed)
                                ))
-                transcript = Transcript(line)
+                try:
+                    transcript = Transcript(line)
+                except (ValueError, TypeError):
+                    raise ValueError((pos, line))
             elif line.is_exon is True:
                 transcript.add_exon(line)
             if tnum >= 10 ** 4 and tnum % 10 ** 4 == 0:
