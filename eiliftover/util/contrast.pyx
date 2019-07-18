@@ -2,7 +2,7 @@ import cython
 cimport numpy as np
 import numpy as np
 
-ctypedef np.int_t DTYPE_t
+# ctypedef np.int_t DTYPE_t
 
 @cython.profile(True)
 @cython.cdivision(True)
