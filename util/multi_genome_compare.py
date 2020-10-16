@@ -61,7 +61,7 @@ def memoize_bed(string, sql):
         pos = parser.tell()  # This will be 0 as we are at the beginning
         for line in parser:
             fields = line.split(b"\t")
-            if len(fields) != 12 or (fields and fields[0][0] == b"#"):
+            if len(fields) < 12 or (fields and fields[0][0] == b"#"):
                 header = True
             else:
                 header = False
@@ -127,8 +127,8 @@ class ComparisonWorker(mp.Process):
 
         new_bed = bed.to_transcriptomic(sequence=cdna, lenient=True)
         if new_bed.coding is False and bed.coding is True:
-            raise AssertionError("The transcriptomic BED has been transformed incorrectly. Reason: {}".format(
-                new_bed.invalid_reason
+            raise AssertionError("The transcriptomic BED has been transformed incorrectly. Reason: {}, for transcript {}, line {}".format(
+                new_bed.invalid_reason, transcript, line
             ))
         if bed.phase and new_bed.phase != bed.phase:
             raise AssertionError("The transcriptomic BED has been transformed incorrectly. Phases: {}, {}, {}".format(
@@ -525,6 +525,10 @@ def main():
         logger.info("Starting to load BED file")
         memoize_bed(args.bed12, bed_db)
         logger.info("Loaded BED file")
+
+    # Dummy context to create the index (avoids parallel access issues on the workers)
+    with pyfaidx.Fasta(args.cdnas):
+        pass
 
     writer = logging.handlers.QueueListener(logging_queue, logger)
     writer.respect_handler_level = True
